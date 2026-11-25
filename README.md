@@ -87,6 +87,12 @@ If the log reports `X3506: unrecognized compiler target 'vs_5_1'`, the shader co
 
 Place the x64 `d3dcompiler_47.dll` from `Redist\D3D\x64` in a recent Windows SDK beside `victory.exe`. Add `d3dcompiler_47=n,b` to Wine's DLL overrides. Version `10.0.28000.2705` restored the visible startup sequence on an RX 6800 with Wine and vkd3d-proton. [Windows SDK downloads](https://learn.microsoft.com/en-us/windows/apps/windows-sdk/downloads)
 
+### Seconds per frame under Wine
+
+If the world takes seconds a frame under Wine/Proton while the GPU is mostly idle and `wineserver` uses most of a core, the cause is in Wine, not in this branch: wineserver keeps each process's mapped views in a list and walks it on every map and unmap ([Wine bug 60868](https://bugs.winehq.org/show_bug.cgi?id=60868)). The title remaps its memory pages by the thousand each frame, so every call gets slower as views pile up. `perf` on `wineserver` shows almost all of its time in `req_unmap_view` and `is_valid_view_addr`, and the log's texture and copy times grow with the remaps.
+
+A `wineserver` that keeps the views in a tree fixes it: [CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) (by ajsem1337, based on neonbyte1's version; also measured in [fxceless/victory-fork#184](https://github.com/fxceless/victory-fork/issues/184)). It changes only `server/`, so it can be built for the Wine of your Proton and dropped into a copy of that Proton as `files/bin/wineserver`; the server protocol version must match the Proton build (regenerate `server_protocol.h` with `tools/make_requests` before building). On an RX 6900 XT with Proton Experimental 11.0-20261112, same build and settings, the first minutes in the world went from 2,068 to 509 ms a frame (textures 482 → 73 ms, copies 417 → 99 ms) and `wineserver` from ~70 % to ~6 % of a core.
+
 Please report results in an [issue](https://github.com/PastiiJay/klbf-lab/issues): GPU, driver, how long it ran, fps in the window title, and what looks wrong. For a scene-by-scene report, run `py -3 docs/klbf/summarize_log.py run.log --lines FIRST LAST` with the first and last line numbers for one scene. The [log summary tool](docs/klbf/summarize_log.py) reports median timing samples and separates real and presented FPS when frame generation is logged. Patch notes: [CHANGELOG.md](CHANGELOG.md). Full run log: [docs/klbf/results.md](docs/klbf/results.md).
 
 Product names are only used to say what this works with; they belong to their owners. KLBF Lab is not affiliated with them. License: GPL-3.0.
