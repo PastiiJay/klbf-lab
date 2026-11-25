@@ -788,6 +788,8 @@ void look() {
         step: &'static str,
         /// On the card, not on the software adapter.
         card: bool,
+        /// Held last so all WARP D3D12 COM objects drop before releasing the lock.
+        _warp_lock: Option<std::sync::MutexGuard<'static, ()>>,
     }
 
     impl Rig {
@@ -798,6 +800,7 @@ void look() {
             // SAFETY: plain object creation on a device of our own.
             unsafe {
                 let card = std::env::var_os("VICTORY_TILES_TEST_CARD").is_some_and(|v| v == "1");
+                let _warp_lock = (!card).then(crate::host::warp_test_lock);
                 // The debug layer, before the device is made: a call that
                 // is not well formed is then refused and named by the
                 // runtime, not handed to the driver.
@@ -858,6 +861,7 @@ void look() {
                     messages,
                     step: "making the device",
                     card,
+                    _warp_lock,
                 })
             }
         }
