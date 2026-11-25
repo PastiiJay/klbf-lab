@@ -928,6 +928,10 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // Release any lazy GPU-resident `PAGE_NOACCESS` pages WITHOUT overwriting
+    // the freshly written DirectStorage / kernel bytes with stale GPU bytes
+    // (restoring GPU bytes only in any unwritten partial-page complement).
+    crate::shadow::lazy_release_written_range(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -939,7 +943,6 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    crate::shadow::lazy_flush_range(at, len);
     {
         let mut g = guards();
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
@@ -1098,6 +1101,10 @@ pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync
 /// ([`title_memory_remapping`]).
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
+    /// Scoped active-remap barrier in `shadow::LAZY_TABLE` preventing concurrent
+    /// relay/submit threads from re-arming `PAGE_NOACCESS` on `[at, at + len)`
+    /// while views are being unmapped or replaced; dropped after `_held`.
+    _lazy: crate::shadow::LazyRemapGuard,
     since: std::time::Instant,
 }
 
@@ -1114,7 +1121,7 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
-    crate::shadow::lazy_flush_range(at, len);
+    let lazy = crate::shadow::lazy_begin_remapping(at, len);
     let started = std::time::Instant::now();
     let held = if by_range() {
         let end = at.saturating_add(len);
@@ -1138,6 +1145,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
         _held: held,
+        _lazy: lazy,
         since: std::time::Instant::now(),
     }
 }
