@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Re
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HMODULE, LocalFree,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, HANDLE, HMODULE, LocalFree,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64, GetThreadContext, IMAGEHLP_LINEW64,
@@ -586,6 +586,9 @@ struct Sampler {
     frames: [u64; MAX_DEPTH],
     /// Cycles of the processor's counter per microsecond.
     cycles_per_us: f64,
+    /// Whether a thread's cycles are the processor's counter ([`cycles_of`]):
+    /// not under Wine, where its kernel and user time stands in.
+    exact: bool,
     /// The cycles a waiting thread uses at most to be suspended and let
     /// go again ([`SETTLING_US`]).
     settling: u64,
@@ -619,6 +622,9 @@ impl Sampler {
         assert!(!copy.is_null(), "no memory for the profiler's stack copy");
         let clock = Instant::now();
         let cycles_per_us = cycles_per_us();
+        let mut cycles = 0;
+        // SAFETY: the current thread's pseudo-handle and a valid out pointer.
+        let exact = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) } != 0;
         // SAFETY: a zeroed CONTEXT is valid.
         let context = Box::new(Aligned(unsafe { std::mem::zeroed() }));
         Sampler {
@@ -635,6 +641,7 @@ impl Sampler {
             dirty: 0,
             frames: [0; MAX_DEPTH],
             cycles_per_us,
+            exact,
             settling: (SETTLING_US * cycles_per_us) as u64,
             clock,
             presents: &FRAMES,
@@ -716,12 +723,10 @@ impl Sampler {
         let reuse = self.config.reuse;
         let thread = &mut self.threads[at];
         thread.looks += 1;
-        let mut cycles = 0;
-        // SAFETY: a thread handle of ours and a valid out pointer.
-        if unsafe { QueryThreadCycleTime(thread.handle, &mut cycles) } == 0 {
+        let Some(cycles) = cycles_of(thread.handle, self.exact, self.cycles_per_us) else {
             thread.missed += 1;
             return;
-        }
+        };
         let ran = cycles.saturating_sub(thread.cycles);
         thread.cycles = cycles;
         // It has not run since the last look: it is where it was. A
@@ -773,7 +778,12 @@ impl Sampler {
                 node
             }
         };
-        let cpu = ((ran as f64 / self.cycles_per_us) as u64).min(weight);
+        // Where the counter is exact a look's share is at most its weight. A
+        // stand-in tick (see [`cycles_of`]) is the time since the thread's last
+        // tick, read at the look that sees it, so it may exceed the weight:
+        // the sums over a run stay right.
+        let cpu = (ran as f64 / self.cycles_per_us) as u64;
+        let cpu = if self.exact { cpu.min(weight) } else { cpu };
         let thread = &mut self.threads[at];
         thread.last = Some(node);
         let node = &mut thread.tree.nodes[node as usize];
@@ -985,9 +995,7 @@ impl Sampler {
             return;
         }
         let (low, high) = stack_of(handle);
-        let mut cycles = 0;
-        // SAFETY: a thread handle of ours and a valid out pointer.
-        unsafe { QueryThreadCycleTime(handle, &mut cycles) };
+        let cycles = cycles_of(handle, self.exact, self.cycles_per_us).unwrap_or(0);
         self.threads.push(Thread {
             id,
             handle,
@@ -1082,9 +1090,7 @@ impl Sampler {
                     if handle.is_null() {
                         continue;
                     }
-                    let mut cycles = 0;
-                    // SAFETY: a thread handle of ours, a valid out pointer.
-                    unsafe { QueryThreadCycleTime(handle, &mut cycles) };
+                    let cycles = cycles_of(handle, self.exact, self.cycles_per_us).unwrap_or(0);
                     v.insert(Other {
                         handle,
                         cycles,
@@ -1112,9 +1118,7 @@ impl Sampler {
                 }
                 continue;
             }
-            let mut cycles = 0;
-            // SAFETY: a thread handle of ours and a valid out pointer.
-            unsafe { QueryThreadCycleTime(other.handle, &mut cycles) };
+            let cycles = cycles_of(other.handle, self.exact, self.cycles_per_us).unwrap_or(0);
             busy.push((cycles.saturating_sub(other.cycles), id));
             other.cycles = cycles;
         }
@@ -1487,6 +1491,35 @@ fn start_of(thread: HANDLE) -> u64 {
         NtQueryInformationThread(thread, 9, (&raw mut start).cast(), 8, null_mut());
     }
     start
+}
+
+/// The processor cycles a thread has used, or `None` if it cannot be asked
+/// (it ended). Where `exact` is false (Wine: `QueryThreadCycleTime` is a
+/// stub that fails with ERROR_CALL_NOT_IMPLEMENTED) the thread's kernel and
+/// user time stands in, as cycles at `cycles_per_us`.
+fn cycles_of(thread: HANDLE, exact: bool, cycles_per_us: f64) -> Option<u64> {
+    if exact {
+        let mut cycles = 0;
+        // SAFETY: a thread handle of ours and a valid out pointer.
+        let ok = unsafe { QueryThreadCycleTime(thread, &mut cycles) } != 0;
+        return ok.then_some(cycles);
+    }
+    // ponytail: Wine counts that time in 10 ms ticks, so a thread that runs
+    // less than a tick between two looks reads as not having run. Exact
+    // again once Wine implements QueryThreadCycleTime.
+    // SAFETY: FILETIME is plain data; zero is a valid value.
+    let mut times: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+    // SAFETY: a thread handle of ours and four valid out pointers.
+    let ok = unsafe {
+        GetThreadTimes(thread, &mut times[0], &mut times[1], &mut times[2], &mut times[3])
+    };
+    if ok == 0 {
+        return None;
+    }
+    // Kernel and user time, in units of 100 ns.
+    let ticks = |t: &FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    let hundred_ns = ticks(&times[2]) + ticks(&times[3]);
+    Some((hundred_ns as f64 / 10.0 * cycles_per_us) as u64)
 }
 
 fn thread_name(thread: HANDLE) -> String {
@@ -2098,11 +2131,19 @@ impl Symbols {
             }
             (Some(dbghelp), _) => {
                 // An export names the function only if it starts it: the
-                // nearest export below is some other function's.
-                let export = dbghelp.symbol(address).filter(|&(_, at)| match start {
-                    Some(start) => at >= start && at <= address,
-                    None => at <= address && address - at < 0x100,
-                });
+                // nearest export below is some other function's. Wine's
+                // exports carry no size and name only their own address, so
+                // a frame inside one is named by the function's start.
+                let export = dbghelp
+                    .symbol(address)
+                    .filter(|&(_, at)| match start {
+                        Some(start) => at >= start && at <= address,
+                        None => at <= address && address - at < 0x100,
+                    })
+                    .or_else(|| {
+                        let start = start?;
+                        dbghelp.symbol(start).filter(|&(_, at)| at == start)
+                    });
                 match export {
                     Some((name, _)) => {
                         let module = label.rsplit_once('.').map_or(&*label, |(stem, _)| stem);

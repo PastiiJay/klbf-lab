@@ -253,6 +253,64 @@ fn time_goes_to_the_function_that_spent_it() {
     );
 }
 
+/// A busy thread and one blocked on a lock, both sampled; the blocked one
+/// is seen in a kernel wait. Needs the clock and the names of the system's
+/// waits, not the names of our own functions.
+#[test]
+fn a_blocked_thread_is_sampled_in_a_kernel_wait() {
+    static PRESENTS: AtomicU64 = AtomicU64::new(0);
+    let stop = Arc::new(AtomicBool::new(false));
+    let lock = Arc::new(Mutex::new(0u64));
+    let held = lock.lock().unwrap();
+    let (spinning, a) = thread({
+        let stop = stop.clone();
+        move || {
+            std::hint::black_box(profile_test_spins(&stop));
+        }
+    });
+    let (locked, c) = thread({
+        let lock = lock.clone();
+        move || {
+            std::hint::black_box(profile_test_locks(&lock));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut sampler = Sampler::new(config(1000));
+    sampler.presents = &PRESENTS;
+    sampler.follow(spinning, Role::Submit, null_mut(), Some("spins".into()));
+    sampler.follow(locked, Role::Wide, null_mut(), Some("locks".into()));
+    sample(
+        &mut sampler,
+        Duration::from_millis(1000),
+        Duration::from_millis(1),
+        &PRESENTS,
+        0,
+    );
+    let report = sampler.report();
+    stop.store(true, Relaxed);
+    drop(held);
+    for running in [a, c] {
+        running.join().unwrap();
+    }
+
+    let spins = role(&report, Role::Submit);
+    assert!(spins.wall >= 800_000, "{} us sampled", spins.wall);
+    assert!(
+        spins.waiting * 100 <= spins.wall * 5,
+        "waiting {}",
+        spins.waiting
+    );
+    let locks = role(&report, Role::Wide);
+    assert!(locks.wall >= 800_000, "{} us sampled", locks.wall);
+    assert!(
+        locks.waiting * 100 >= locks.wall * 95,
+        "{} of {}",
+        locks.waiting,
+        locks.wall
+    );
+}
+
 /// A stack deeper than is kept, and one longer than is copied: the
 /// innermost frames are still named, and the stack is marked as cut.
 #[test]
