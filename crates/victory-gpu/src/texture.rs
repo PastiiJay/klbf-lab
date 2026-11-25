@@ -408,20 +408,36 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if self
+            .mem
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            RESIDENT[0].fetch_sub(1, Relaxed);
+            RESIDENT[1].fetch_sub(self.bytes, Relaxed);
+        }
     }
 }
 
-/// For the memory line: staging buffers alive, their bytes, and how many
-/// of them their texture still has (the others wait for a list's reset).
+/// For the memory line: staging records alive, their bytes, how many of
+/// them their texture still has (the others wait for a list's reset), and
+/// the staging buffers that exist now and their bytes.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn memory() -> [u64; 3] {
+pub(crate) fn memory() -> [u64; 5] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(0, |map| map.len() as u64);
-    [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
+    [
+        STAGED[0].load(Relaxed),
+        STAGED[1].load(Relaxed),
+        kept,
+        RESIDENT[0].load(Relaxed),
+        RESIDENT[1].load(Relaxed),
+    ]
 }
 
 /// How long a sampled texture stays unchanged before its staging buffer
@@ -430,6 +446,78 @@ pub(crate) fn memory() -> [u64; 3] {
 /// time.
 const UNCHANGED_MS: u64 = 2_000;
 const UNCHANGED_FRAMES: u64 = 30;
+
+/// What [`let_go_idle`] knows of a texture still sampled when it decides
+/// whether its staging buffer may go.
+#[derive(Clone, Copy)]
+struct Lighten {
+    /// A list holds the staging (an upload or a check recorded, not reset).
+    held_elsewhere: bool,
+    uploaded: bool,
+    dirty: bool,
+    /// A level waits for tiles: once the card has room it is uploaded again
+    /// from these bytes (`upload`), and an unchanged texture is not detiled
+    /// again to refill them.
+    waiting: bool,
+    /// Not detiled for [`UNCHANGED_MS`] and [`UNCHANGED_FRAMES`].
+    unchanged_long: bool,
+}
+
+/// Whether the staging buffer of a texture still sampled may go, its record
+/// staying: no list holds it, its contents were uploaded and have not
+/// changed for a while, and no level waits for tiles.
+fn buffer_may_go(t: Lighten) -> bool {
+    !t.held_elsewhere && t.uploaded && !t.dirty && !t.waiting && t.unchanged_long
+}
+
+#[cfg(test)]
+mod lighten_tests {
+    use super::{Lighten, buffer_may_go};
+
+    const SETTLED: Lighten = Lighten {
+        held_elsewhere: false,
+        uploaded: true,
+        dirty: false,
+        waiting: false,
+        unchanged_long: true,
+    };
+
+    #[test]
+    fn a_settled_texture_lets_its_buffer_go() {
+        assert!(buffer_may_go(SETTLED));
+    }
+
+    /// Any one reason keeps the buffer, among them a level waiting for
+    /// tiles (PastiiJay/klbf-lab#23, HandshakeHackin's fixture).
+    #[test]
+    fn each_reason_keeps_the_buffer() {
+        let keeps = [
+            Lighten {
+                held_elsewhere: true,
+                ..SETTLED
+            },
+            Lighten {
+                uploaded: false,
+                ..SETTLED
+            },
+            Lighten {
+                dirty: true,
+                ..SETTLED
+            },
+            Lighten {
+                waiting: true,
+                ..SETTLED
+            },
+            Lighten {
+                unchanged_long: false,
+                ..SETTLED
+            },
+        ];
+        for (i, t) in keeps.into_iter().enumerate() {
+            assert!(!buffer_may_go(t), "case {i}");
+        }
+    }
+}
 
 /// `VICTORY_STAGING_KEEP=1`: keep the staging buffer of every texture
 /// sampled lately, as before (system memory the size of each texture).
@@ -442,6 +530,11 @@ fn staging_keep() -> bool {
 /// their bytes; and those made anew for a texture that changed after.
 static LIGHTENED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 static REMADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Staging buffers that exist now, and their bytes: `STAGED` counts the
+/// records, which outlive a buffer let go as unchanged.
+static RESIDENT: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// For the memory line: staging buffers let go as unchanged, and made
 /// anew (count, bytes each).
@@ -492,14 +585,23 @@ pub(crate) fn let_go_idle() {
         // uploaded again nor detiled again until its memory changes.
         if keep
             && lighten
-            && Arc::strong_count(s) == 1
-            && s.uploaded.load(Relaxed)
-            && !s.dirty.load(Relaxed)
-            && crate::host::long_ago(s.changed.load(Relaxed), UNCHANGED_MS, UNCHANGED_FRAMES)
+            && buffer_may_go(Lighten {
+                held_elsewhere: Arc::strong_count(s) > 1,
+                uploaded: s.uploaded.load(Relaxed),
+                dirty: s.dirty.load(Relaxed),
+                waiting: s.waiting.load(Relaxed) != 0,
+                unchanged_long: crate::host::long_ago(
+                    s.changed.load(Relaxed),
+                    UNCHANGED_MS,
+                    UNCHANGED_FRAMES,
+                ),
+            })
             && s.mem.lock().unwrap_or_else(|e| e.into_inner()).take().is_some()
         {
             LIGHTENED[0].fetch_add(1, Relaxed);
             LIGHTENED[1].fetch_add(s.bytes, Relaxed);
+            RESIDENT[0].fetch_sub(1, Relaxed);
+            RESIDENT[1].fetch_sub(s.bytes, Relaxed);
         }
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
@@ -895,6 +997,8 @@ impl Staging {
             crate::host::name(&buffer, || format!("staging of {:?} again", self.memory));
             REMADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             REMADE[1].fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+            RESIDENT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RESIDENT[1].fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
             *mem = Some((buffer, data as usize));
         }
         mem.as_ref().map(|&(_, data)| data)
@@ -1483,6 +1587,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    RESIDENT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RESIDENT[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         mem: Mutex::new(Some((buffer, data as usize))),
         #[cfg(feature = "diagnostics")]

@@ -785,7 +785,7 @@ fn log_memory() {
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
          left to commit); host copies of title memory: {} alive {:.0} MB, of them {} windows \
          outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
-         textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
+         textures: {} alive {:.0} MB, {} kept by their texture, {} with a buffer {:.0} MB; host textures: {} alive {:.0} MB, \
          {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
          {:.0} MB, {} card buffers {:.0} MB",
         mb(private),
@@ -801,6 +801,8 @@ fn log_memory() {
         staged[0],
         mb(staged[1]),
         staged[2],
+        staged[3],
+        mb(staged[4]),
         textures[0],
         mb(textures[1]),
         crate::resource::placed_textures(),
