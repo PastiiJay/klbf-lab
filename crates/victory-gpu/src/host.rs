@@ -38,7 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
-    queue: ID3D12CommandQueue,
+    pub(crate) queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -1808,7 +1808,11 @@ unsafe fn dispatch_card_compare(
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        relay()
+            && !crate::shadow::lazy_copyback()
+            && std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1")
+    })
 }
 
 /// The bytes of the PC's memory pieces fetched inside flights go to
@@ -2685,6 +2689,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
 /// width), they are settled and memory is asked again.
 pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
+    crate::shadow::lazy_pin_range(address, bytes);
     {
         let line = line();
         if line.line.is_empty() && line.in_hand.is_empty() {
@@ -3970,6 +3975,8 @@ impl Host {
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
+            let lazy = crate::shadow::lazy_copyback();
+            let max_sent_as = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
             let mut seen = std::collections::HashSet::new();
             for plan in plans {
                 let flags: Vec<(usize, u32, bool)> = plan
@@ -3991,6 +3998,9 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && seen.insert((copy, lo, hi)) {
+                            if lazy && r.shadow.try_defer_piece_relay(lo, hi, max_sent_as) {
+                                continue;
+                            }
                             pieces.push((r.shadow.clone(), lo, hi, total));
                             total += (hi - lo) as u64;
                         }
@@ -4393,6 +4403,7 @@ impl Host {
         let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
+        let lazy = crate::shadow::lazy_copyback();
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
@@ -4402,6 +4413,9 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                    if lazy && r.shadow.try_defer_piece(lo, hi) {
+                        continue;
+                    }
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -5905,6 +5919,7 @@ impl HostList {
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
+        crate::shadow::lazy_pin_range(dst as usize, bytes);
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
@@ -6297,6 +6312,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    // Materialize any lazy GPU-resident `PAGE_NOACCESS` pages before
+    // `ReadProcessMemory` (which does not enter VEH).
+    crate::shadow::lazy_flush_range(src as usize, len);
+    if title_dst {
+        crate::shadow::lazy_flush_range(dst as usize, len);
+    }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -6396,6 +6417,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::shadow::lazy_flush_range(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -6438,6 +6460,7 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    crate::shadow::lazy_flush_range(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
