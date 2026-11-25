@@ -6517,12 +6517,13 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 }
 
 /// Whether reads and kernel-style write-backs copy in-process guarded by a
-/// vectored exception handler (`VICTORY_DIRECT_COPY=0` restores
-/// `ReadProcessMemory` / `NtWriteVirtualMemory`).
+/// vectored exception handler (`VICTORY_DIRECT_COPY=1`; otherwise
+/// `ReadProcessMemory` / `NtWriteVirtualMemory`). Opt-in, as in klbf-lab
+/// issue #19's adaptation.
 fn direct_copy_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_DIRECT_COPY").is_none_or(|v| v != "0")
+        std::env::var_os("VICTORY_DIRECT_COPY").is_some_and(|v| v == "1")
     })
 }
 
