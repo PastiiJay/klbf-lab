@@ -2638,13 +2638,19 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.writes_pending()
-            {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+            match step {
+                Step::Refresh(shadow, address, len) if shadow.writes_pending() => {
+                    match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+                        Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
+                        None => spans.push((shadow.clone(), *address, *address + *len)),
+                    }
                 }
+                Step::GpuWrite(shadow, address, len)
+                    if shadow.writes_pending() && shadow.has_lazy_resync_under_writes(*address, *len) =>
+                {
+                    return true;
+                }
+                _ => {}
             }
         }
     }
@@ -6312,12 +6318,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
-    // Materialize any lazy GPU-resident `PAGE_NOACCESS` pages before
-    // `ReadProcessMemory` (which does not enter VEH).
-    crate::shadow::lazy_flush_range(src as usize, len);
-    if title_dst {
-        crate::shadow::lazy_flush_range(dst as usize, len);
-    }
+    // Materialize any lazy GPU-resident `PAGE_NOACCESS` pages and hold a scoped
+    // non-arming range barrier across `ReadProcessMemory` / `read_sparse` /
+    // `read_pieces` so concurrent relay `try_defer_piece_relay` cannot re-arm
+    // `PAGE_NOACCESS` mid-copy.
+    let _lazy_src = crate::shadow::lazy_flush_and_hold(src as usize, len);
+    let _lazy_dst = title_dst.then(|| crate::shadow::lazy_flush_and_hold(dst as usize, len));
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -6417,7 +6423,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    crate::shadow::lazy_flush_range(src as usize, dst.len());
+    let _lazy = crate::shadow::lazy_flush_and_hold(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -6460,7 +6466,7 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    crate::shadow::lazy_flush_range(dst as usize, len);
+    let _lazy = crate::shadow::lazy_flush_and_hold(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();

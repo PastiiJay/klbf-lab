@@ -461,12 +461,14 @@ mod rebar {
         if size == 0 {
             return None;
         }
-        placed
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(size).filter(|&next| next <= most)
-            })
-            .ok()
-            .map(|before| before + size)
+        let mut used = placed.load(Ordering::Relaxed);
+        loop {
+            let next = used.checked_add(size).filter(|&n| n <= most)?;
+            match placed.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(next),
+                Err(cur) => used = cur,
+            }
+        }
     }
 
     fn reserve_with_card(
@@ -486,13 +488,19 @@ mod rebar {
             return Some(next);
         };
         let limit = card_limit_bytes(budget, vram_pct);
-        in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                let effective_used = used.checked_add(cur)?;
-                let next_used = effective_used.checked_add(size)?;
-                (next_used <= limit).then(|| cur + size)
-            })
-            .ok()?;
+        let mut cur = in_flight.load(Ordering::Acquire);
+        loop {
+            let effective_used = used.checked_add(cur)?;
+            let next_used = effective_used.checked_add(size)?;
+            if next_used > limit {
+                return None;
+            }
+            let next = cur + size;
+            match in_flight.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
         match reserve_bytes(placed, size, most) {
             Some(next) => Some(next),
             None => {
@@ -3829,19 +3837,47 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        // Flush any overlapping OTHER shadow's deferred pages before shaders
-        // run on this shadow so nested/exact views observe fresh GPU writes.
-        let end = address.saturating_add(len);
-        if LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
-            let flushed = lazy_flush_other_shadows(self.id, address, end);
-            if !flushed.is_empty() {
-                self.resync_pages_from_title(&flushed);
+        // Flush overlapping OTHER shadows' deferred pages and resync any
+        // `LAZY_RESYNC` pages ONLY on subranges not already in `self.pending`:
+        // ranges in `self.pending` may be concurrently read/merged by the relay
+        // thread (`card_merge_relay` holding `self.before.lock()` over `self.data`)
+        // and still need their `FlushedBaseline` intact.
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        let need_other = LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0;
+        let need_resync = self.resync_count.load(Ordering::Acquire) > 0;
+        if from < to && (need_other || need_resync) {
+            let busy_raw: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .filter(|&(a, e)| a < to && e > from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let free: Vec<(usize, usize)> = if busy_raw.is_empty() {
+                vec![(from, to)]
+            } else {
+                let busy_pages: Vec<(usize, usize)> = busy_raw
+                    .iter()
+                    .map(|&(a, e)| (a & !(PAGE - 1), e.div_ceil(PAGE).saturating_mul(PAGE)))
+                    .collect();
+                outside(from, to, busy_pages)
+            };
+            for (a, e) in free {
+                if need_other && LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+                    let flushed = lazy_flush_other_shadows(self.id, a, e);
+                    if !flushed.is_empty() {
+                        self.resync_pages_from_title(&flushed, &busy_raw);
+                    }
+                }
+                if self.resync_count.load(Ordering::Acquire) > 0 {
+                    self.lazy_resync_range(a, e, &busy_raw);
+                }
             }
-        }
-        // If any page in this range was demand-flushed by VEH since the last
-        // GPU use, resync it into the CPU side / staging before shaders run.
-        if self.resync_count.load(Ordering::Acquire) > 0 {
-            self.lazy_resync_range(address, end);
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -4462,11 +4498,26 @@ impl Shadow {
                     if lo >= hi {
                         continue;
                     }
+                    let st_before = self.lazy_state[page - base].load(Ordering::Acquire);
+                    if is_lazy_held(st_before) {
+                        continue;
+                    }
+                    if st_before == LAZY_RESYNC {
+                        return true;
+                    }
                     let n = hi - lo;
                     let title = &mut title_buf[..n];
                     let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                     if !crate::host::read_into(lo as *const u8, title) {
                         continue;
+                    }
+                    // Re-check after `read_into`: if a concurrent VEH fault (or
+                    // `read_into`'s flush) transitioned this page to
+                    // `LAZY_RESYNC` after the upfront check, `title` holds
+                    // prior GPU bytes that must not be diffed against stale
+                    // `self.data` / snapshot — settle in-flight flights instead.
+                    if self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC {
+                        return true;
                     }
                     MERGED[0].fetch_add(1, Ordering::Relaxed);
                     let at = lo - start;
@@ -4516,6 +4567,43 @@ impl Shadow {
         })
     }
 
+    /// Whether `[address, address + len)` overlaps both `self.pending` and at
+    /// least one `LAZY_RESYNC` page (used by `host::stale_under_flights` for
+    /// UAV-only `Step::GpuWrite` commands without a preceding `Step::Refresh`).
+    pub(crate) fn has_lazy_resync_under_writes(&self, address: usize, len: usize) -> bool {
+        if self.resync_count.load(Ordering::Acquire) == 0 || !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return false;
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        if busy.is_empty() {
+            return false;
+        }
+        let base = start / PAGE;
+        for (a, e) in busy {
+            for page in a / PAGE..e.div_ceil(PAGE) {
+                if page >= base
+                    && (page - base) < self.lazy_state.len()
+                    && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -4530,7 +4618,7 @@ impl Shadow {
             return 0;
         }
         if !self.has_pending.load(Ordering::Acquire) {
-            return self.update_free(from, to);
+            return self.update_free(from, to, &[]);
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -4543,23 +4631,23 @@ impl Shadow {
         if !busy.is_empty() {
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
+            for &(a, e) in &busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, &busy);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, &busy);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, &[])
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) -> usize {
         // Flush any overlapping OTHER shadow's deferred pages before querying
         // write-watch/guards so nested buffers and `Shadow::exact` views see
         // fresh GPU writes even when `watch::ask_once` is active.
@@ -4576,7 +4664,7 @@ impl Shadow {
             }
         }
         if self.deferred_count.load(Ordering::Acquire) > 0 || self.resync_count.load(Ordering::Acquire) > 0 {
-            self.lazy_prepare_update(from, to);
+            self.lazy_prepare_update(from, to, skip_busy);
         }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -5764,6 +5852,12 @@ pub(crate) fn lazy_copyback() -> bool {
 static LAZY_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(test)]
+type PostTransitionHook = Box<dyn FnOnce(usize) + Send>;
+
+#[cfg(test)]
+static TRY_DEFER_POST_TRANSITION_HOOK: Mutex<Option<PostTransitionHook>> = Mutex::new(None);
+
+#[cfg(test)]
 static LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
@@ -6532,6 +6626,20 @@ impl Drop for LazyRemapGuard {
 /// flushes all currently deferred pages overlapping `[at, at + len)` before
 /// returning the guard. Safe to call with zero Level 0 locks held.
 pub(crate) fn lazy_begin_remapping(at: usize, len: usize) -> LazyRemapGuard {
+    lazy_flush_and_hold(at, len)
+}
+
+/// Registers a scoped non-arming range barrier for `[at, at + len)` in
+/// `LAZY_TABLE.remapping` and flushes any currently armed or in-flight-arming
+/// deferred pages in that range before returning. While the returned guard is
+/// live, no concurrent relay/submit thread can arm `PAGE_NOACCESS` on any page
+/// overlapping `[at, at + len)` (eliminating TOCTOU races with
+/// `ReadProcessMemory` / `read_sparse` / `NtWriteVirtualMemory` /
+/// `WriteProcessMemory`).
+///
+/// Fast path when `VICTORY_LAZY_COPYBACK` is OFF: returns an inert guard with
+/// zero locking.
+pub(crate) fn lazy_flush_and_hold(at: usize, len: usize) -> LazyRemapGuard {
     if len == 0 || !lazy_copyback() {
         return LazyRemapGuard { id: None };
     }
@@ -6544,8 +6652,9 @@ pub(crate) fn lazy_begin_remapping(at: usize, len: usize) -> LazyRemapGuard {
         table.remapping.push((id, first, last));
         id
     };
+    let guard = LazyRemapGuard { id: Some(id) };
     lazy_flush_range(at, len);
-    LazyRemapGuard { id: Some(id) }
+    guard
 }
 
 /// Releases deferred `PAGE_NOACCESS` pages overlapping `[at, at + len)` AFTER
@@ -6553,7 +6662,9 @@ pub(crate) fn lazy_begin_remapping(at: usize, len: usize) -> LazyRemapGuard {
 /// backing physical pages (`watch::title_memory_written`):
 /// - For deferred pages wholly covered by `[at, at + len)`: restores
 ///   `PAGE_READWRITE` without copying stale GPU bytes over the freshly written
-///   data and marks `LAZY_RESYNC` (no stale GPU baseline).
+///   data, captures GPU bytes into `FlushedBaseline` only if `writes_pending()`
+///   is true (so in-flight relay merges diff against the deferred GPU bytes and
+///   preserve the freshly written title bytes), and marks `LAZY_RESYNC`.
 /// - For partially covered 64 KiB deferred pages (`[w_lo, w_hi)`): copies GPU
 ///   bytes ONLY into the unwritten complement `[page_addr..w_lo)` and
 ///   `[w_hi..page_end)`, never touching `[w_lo..w_hi)`, restores `PAGE_READWRITE`,
@@ -6612,11 +6723,30 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                 let w_lo = at.max(page_addr);
                 let w_hi = end.min(page_end);
                 let full_cover = w_lo == page_addr && w_hi == page_end;
-                let baseline = if full_cover {
+                let mut baseline = if full_cover {
                     // Fresh bytes cover all 64 KiB: restore `PAGE_READWRITE`
-                    // without touching title memory or inserting a stale baseline.
+                    // without ever touching title memory. When a flight is
+                    // still pending on this shadow (`writes_pending()`), capture
+                    // the GPU bytes into `FlushedBaseline` (without writing
+                    // them to title memory) so in-flight `card_merge_relay` /
+                    // `relay_merge` diffs against the deferred GPU bytes rather
+                    // than stale `self.data` and preserves 100% of the freshly
+                    // written title bytes.
+                    let captured = if shadow.writes_pending() {
+                        let mut buf = vec![0u8; PAGE];
+                        let ok = {
+                            let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+                            gpu.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                        };
+                        if ok {
+                            LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+                        }
+                        ok.then_some(buf)
+                    } else {
+                        None
+                    };
                     let _ = unprotect_and_write_page(page_addr, None, None);
-                    None
+                    captured
                 } else {
                     // Partial overwrite: fetch GPU page and write ONLY the
                     // unwritten complement `[page_addr..w_lo)` and `[w_hi..page_end)`.
@@ -6641,6 +6771,19 @@ pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
                     }
                     (ok && wrote).then_some(buf)
                 };
+                // Guard against a concurrent `Shadow::writing` setting
+                // `has_pending` after the initial `full_cover` check.
+                if full_cover && baseline.is_none() && shadow.writes_pending() {
+                    let mut buf = vec![0u8; PAGE];
+                    let ok = {
+                        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+                        gpu.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                    };
+                    if ok {
+                        LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+                        baseline = Some(buf);
+                    }
+                }
                 {
                     let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
                     table.pages.remove(&page);
@@ -6938,11 +7081,23 @@ impl Shadow {
                 _ => None,
             };
             // Atomically transition single-view clean `watch`-guarded page
-            // directly `PAGE_READONLY -> PAGE_NOACCESS`.
-            if crate::watch::transition_clean_guard_to_noaccess(page)
-                && !crate::watch::was_written_since(page, copied_at)
-            {
-                armed_ok = true;
+            // directly `PAGE_READONLY -> PAGE_NOACCESS`. Once transitioned,
+            // mark `restore_rw = true` immediately so any subsequent rejection
+            // (e.g. concurrent `watch::wrote` advancing the journal stamp)
+            // always rolls back `PAGE_NOACCESS -> PAGE_READWRITE`.
+            if crate::watch::transition_clean_guard_to_noaccess(page) {
+                restore_rw = true;
+                #[cfg(test)]
+                if let Some(hook) = TRY_DEFER_POST_TRANSITION_HOOK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    hook(page);
+                }
+                if !crate::watch::was_written_since(page, copied_at) {
+                    armed_ok = true;
+                }
             }
         } else {
             // `MEM_WRITE_WATCH` private memory: set `PAGE_NOACCESS` directly
@@ -7084,8 +7239,9 @@ impl Shadow {
 
     /// Copies specific flushed pages from title memory into this shadow (used by
     /// [`Shadow::writing`] after [`lazy_flush_other_shadows`] materializes another
-    /// overlapping shadow's deferred pages).
-    fn resync_pages_from_title(&self, pages: &[usize]) {
+    /// overlapping shadow's deferred pages), skipping any page intersecting
+    /// `skip_busy` (`self.pending`).
+    fn resync_pages_from_title(&self, pages: &[usize], skip_busy: &[(usize, usize)]) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let watched = self.watched.load(Ordering::Relaxed) == 1;
@@ -7097,12 +7253,17 @@ impl Shadow {
             if idx >= self.lazy_state.len() {
                 continue;
             }
-            let p_lo = (page * PAGE).max(start);
-            let p_hi = ((page + 1) * PAGE).min(end);
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
+            let p_lo = page_lo.max(start);
+            let p_hi = page_hi.min(end);
             if p_lo >= p_hi {
                 continue;
             }
-            let whole = p_lo == page * PAGE && p_hi == (page + 1) * PAGE;
+            let whole = p_lo == page_lo && p_hi == page_hi;
             let now = if watched {
                 crate::watch::writes(p_lo, p_hi, true).map_or(0, |(now, _)| now)
             } else {
@@ -7115,10 +7276,11 @@ impl Shadow {
     }
 
     /// Transitions `LAZY_RESYNC` pages in `[from, to)` back to `LAZY_EAGER`
-    /// and clears their `copied` entry so [`Shadow::update_free`] copies fresh
-    /// title memory (including any CPU writes made after VEH flush) into staging
-    /// and schedules VRAM upload (`card_changed`).
-    fn lazy_prepare_update(&self, from: usize, to: usize) {
+    /// (skipping any page overlapping `skip_busy`) and clears their `copied`
+    /// entry so [`Shadow::update_free`] copies fresh title memory (including
+    /// any CPU writes made after VEH flush) into staging and schedules VRAM
+    /// upload (`card_changed`).
+    fn lazy_prepare_update(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) {
         if self.resync_count.load(Ordering::Acquire) == 0 || from >= to {
             return;
         }
@@ -7127,6 +7289,11 @@ impl Shadow {
         let last = to.div_ceil(PAGE);
         let mut resynced = Vec::new();
         for page in first..last {
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
             let idx = page - base;
             if idx < self.lazy_state.len()
                 && self.lazy_state[idx]
@@ -7152,10 +7319,11 @@ impl Shadow {
         }
     }
 
-    /// Resyncs `LAZY_RESYNC` pages in `[from, to)` directly from title memory
-    /// into `self.data` (and queues `card_changed`) before a UAV-only submission
-    /// declared via [`Shadow::writing`] runs without a preceding `refresh`.
-    fn lazy_resync_range(&self, from: usize, to: usize) {
+    /// Resyncs `LAZY_RESYNC` pages in `[from, to)` (skipping any page
+    /// overlapping `skip_busy`) directly from title memory into `self.data`
+    /// (and queues `card_changed`) before a UAV-only submission declared via
+    /// [`Shadow::writing`] runs without a preceding `refresh`.
+    fn lazy_resync_range(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
@@ -7166,6 +7334,11 @@ impl Shadow {
         let last = to.div_ceil(PAGE);
         let mut pages = Vec::new();
         for page in first..last {
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
             let idx = page - base;
             if idx < self.lazy_state.len()
                 && self.lazy_state[idx]
@@ -8741,6 +8914,425 @@ void main(uint3 tid : SV_DispatchThreadID) {
             drop(shadow);
         }
 
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: when `transition_clean_guard_to_noaccess` succeeds on a
+    /// `MEM_MAPPED` page and `watch::was_written_since(page, copied_at)`
+    /// subsequently rejects arming (e.g., concurrent `watch::wrote` advancing
+    /// the journal stamp without removing `GUARDS`), `try_defer_piece` MUST
+    /// roll the page back to `PAGE_READWRITE` and leave `LAZY_ARMED_COUNT == 0`.
+    #[test]
+    fn lazy_copyback_mem_mapped_write_race_rolls_back_to_readwrite() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+
+        struct AskOnceGuard;
+        impl Drop for AskOnceGuard {
+            fn drop(&mut self) {
+                crate::watch::ask_once_end();
+            }
+        }
+
+        let _guard = LazyTestGuard::enable();
+        let Some(h) = host() else {
+            return;
+        };
+        if !h.card_ready() {
+            return;
+        }
+
+        let block = MappedSectionBlock::new(PAGE);
+        // SAFETY: seed initial bytes inside live mapped view.
+        unsafe { std::ptr::write_bytes(block.ptr, 0x3A, PAGE) };
+        let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+        let page = block.addr() / PAGE;
+
+        // Initialize shadow and arm `watch`'s clean `PAGE_READONLY` guard.
+        let _ = shadow.update(block.addr(), PAGE);
+        let _ = shadow.update(block.addr(), PAGE);
+        let copied_at = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).get(0).unwrap_or(0);
+        assert_ne!(copied_at, 0);
+        assert!(crate::watch::is_guarded(page), "page should be guarded by watch");
+        assert_eq!(page_protect(block.addr()), PAGE_READONLY);
+
+        // Keep `watch`'s standing asking open on a disjoint write-watched page
+        // so `watch::wrote` advances the journal stamp for `block` right after
+        // `PAGE_READONLY -> PAGE_NOACCESS` and before `was_written_since`.
+        let watch_keeper = VirtualBlock::new(PAGE, true);
+        crate::watch::ask_once(&[(watch_keeper.addr(), watch_keeper.addr() + PAGE)]);
+        let _ask_once = AskOnceGuard;
+
+        // Clear any pending card dirty flags so `try_defer_piece` reaches
+        // `transition_clean_guard_to_noaccess`, then inject a concurrent
+        // `watch::wrote` immediately after the protection transition.
+        let _ = card_dirty(1);
+        *TRY_DEFER_POST_TRANSITION_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(|p| {
+            crate::watch::wrote(p * PAGE, PAGE);
+        }));
+        assert!(
+            !shadow.try_defer_piece(0, PAGE),
+            "try_defer_piece must refuse when journal stamp advances after transition"
+        );
+        assert!(
+            TRY_DEFER_POST_TRANSITION_HOOK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "post-transition hook must have fired after transition_clean_guard_to_noaccess"
+        );
+        assert!(
+            crate::watch::was_written_since(page, copied_at),
+            "post-transition hook must have advanced journal stamp past copied_at"
+        );
+        assert_eq!(
+            page_protect(block.addr()),
+            PAGE_READWRITE,
+            "rejected MEM_MAPPED arming must roll back PAGE_NOACCESS -> PAGE_READWRITE"
+        );
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 0);
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+
+        // Direct CPU read and write MUST succeed without unhandled AV.
+        // SAFETY: page was rolled back to `PAGE_READWRITE`.
+        unsafe {
+            assert_eq!(*block.ptr, 0x3A);
+            *block.ptr = 0x7C;
+            assert_eq!(*block.ptr, 0x7C);
+        }
+
+        drop(shadow);
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: `Shadow::writing` MUST NOT touch `self.data`, `LAZY_RESYNC`,
+    /// `FlushedBaseline`, or `card.has_dirty` for subranges still in
+    /// `self.pending`, and `Shadow::has_lazy_resync_under_writes` MUST report
+    /// `true` so `host::stale_under_flights` settles UAV-only `Step::GpuWrite`
+    /// flights cleanly.
+    #[test]
+    fn lazy_copyback_writing_skips_pending_resync_and_stale_under_flights_settles_gpu_write() {
+        let _guard = LazyTestGuard::enable();
+        let Some(h) = host() else {
+            return;
+        };
+        if !h.card_ready() {
+            return;
+        }
+        let Some(pipe) = GpuAddPipeline::new(h) else {
+            return;
+        };
+        let list = h.new_list().expect("new_list");
+
+        let block = VirtualBlock::new(PAGE, true);
+        // SAFETY: seed initial bytes `A`.
+        unsafe { std::ptr::write_bytes(block.ptr, 0x11, PAGE) };
+        let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+        let shadow_id = shadow.id;
+
+        // Flight 0 writes `B` (`0x2424_0000 ^ i`) and arms `LAZY_DEFERRED`.
+        pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x2424_0000, 1);
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
+
+        // Flight 1 declares the page in `self.pending`.
+        shadow.writing(block.addr(), PAGE);
+        assert!(shadow.writes_pending());
+
+        // CPU read faults via VEH -> flushes `B`, marks `LAZY_RESYNC`, records `FlushedBaseline(B)`.
+        // Then CPU writes fresh bytes `0xCAFE_BABE` at dword 4.
+        // SAFETY: VEH demand-flushes page to `PAGE_READWRITE`.
+        unsafe {
+            assert_eq!(*block.ptr.cast::<u32>(), 0x2424_0000);
+            block.ptr.cast::<u32>().add(4).write_volatile(0xCAFE_BABE);
+        }
+        assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
+        assert!(
+            shadow.has_lazy_resync_under_writes(block.addr(), PAGE),
+            "UAV-only Step::GpuWrite check must detect pending LAZY_RESYNC page"
+        );
+
+        // Calling `Shadow::writing` again while range is STILL in `self.pending`
+        // MUST skip resync so `FlushedBaseline`, `self.data`, and `card.has_dirty`
+        // stay intact for Flight 1's `card_merge_relay`.
+        shadow.writing(block.addr(), PAGE);
+        assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
+        assert!(
+            !shadow.card.as_ref().unwrap().has_dirty.load(Ordering::Acquire),
+            "Shadow::writing must not dirty card for a pending range"
+        );
+        {
+            let table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                table.flushed_baselines.contains_key(&(shadow_id, 0)),
+                "FlushedBaseline must remain intact while range is pending"
+            );
+        }
+
+        // Flight 1 lands in `card_merge_relay` with `gpu == B`: must write 0 bytes
+        // and preserve CPU's `0xCAFE_BABE`.
+        let mut gpu_b = vec![0u8; PAGE];
+        for i in 0..PAGE / 4 {
+            let v = 0x2424_0000u32 ^ i as u32;
+            gpu_b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut scratch = Vec::new();
+        assert_eq!(shadow.card_merge_relay(0, &gpu_b, 1, &mut scratch), 0);
+        // SAFETY: page is `PAGE_READWRITE`.
+        assert_eq!(unsafe { block.ptr.cast::<u32>().add(4).read_volatile() }, 0xCAFE_BABE);
+
+        // Once Flight 1 retires from `self.pending`, `Shadow::writing` resyncs cleanly.
+        shadow.copy_back_done(&[(block.addr(), block.addr() + PAGE)]);
+        assert!(!shadow.has_lazy_resync_under_writes(block.addr(), PAGE));
+        shadow.writing(block.addr(), PAGE);
+        assert_eq!(shadow.resync_count.load(Ordering::Acquire), 0);
+        assert!(shadow.card.as_ref().unwrap().has_dirty.load(Ordering::Acquire));
+
+        shadow.copy_back_done(&[(block.addr(), block.addr() + PAGE)]);
+        drop(shadow);
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: if a page transitions `LAZY_DEFERRED -> LAZY_RESYNC` AFTER
+    /// `merge_under_writes`'s upfront `resync_count > 0` check, the in-loop
+    /// `LAZY_RESYNC` re-check MUST still return `true` (forcing settle)
+    /// without diffing VEH-flushed GPU bytes against stale `self.data`.
+    #[test]
+    fn lazy_copyback_merge_under_writes_settles_mid_loop_resync() {
+        let _guard = LazyTestGuard::enable();
+        let Some(h) = host() else {
+            return;
+        };
+        if !h.card_ready() {
+            return;
+        }
+        let Some(pipe) = GpuAddPipeline::new(h) else {
+            return;
+        };
+        let list = h.new_list().expect("new_list");
+
+        let block = VirtualBlock::new(PAGE, true);
+        // SAFETY: seed initial bytes `A`.
+        unsafe { std::ptr::write_bytes(block.ptr, 0x11, PAGE) };
+        let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+
+        // Flight 0 writes `B` (`0x5555_0000 ^ i`) and arms `LAZY_DEFERRED`.
+        pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x5555_0000, 1);
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
+
+        // Flight 1 marks range pending; VEH flushes `B` -> `LAZY_RESYNC`.
+        shadow.writing(block.addr(), PAGE);
+        // SAFETY: VEH demand-flushes page to `PAGE_READWRITE`.
+        assert_eq!(unsafe { *block.ptr.cast::<u32>() }, 0x5555_0000);
+        assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
+        assert_eq!(shadow.lazy_state[0].load(Ordering::Acquire), LAZY_RESYNC);
+
+        // Simulate VEH racing right after `merge_under_writes`'s upfront
+        // `resync_count > 0` check by temporarily hiding `resync_count == 0`
+        // while `lazy_state[0]` is `LAZY_RESYNC`.
+        shadow.resync_count.store(0, Ordering::Release);
+        let mut runs_left = 1024;
+        let must_settle = shadow.merge_under_writes(block.addr(), PAGE, &mut runs_left);
+        shadow.resync_count.store(1, Ordering::Release);
+
+        assert!(must_settle, "in-loop LAZY_RESYNC check must force flight settle");
+        assert!(
+            !shadow.card.as_ref().unwrap().has_dirty.load(Ordering::Acquire),
+            "merge_under_writes must NOT queue bogus card_changed uploads on LAZY_RESYNC"
+        );
+        // SAFETY: `self.data` still holds pre-GPU `0x11` bytes.
+        assert_eq!(unsafe { *shadow.data }, 0x11);
+
+        shadow.copy_back_done(&[(block.addr(), block.addr() + PAGE)]);
+        drop(shadow);
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: `lazy_release_written_range` with `full_cover == true`
+    /// while `shadow.writes_pending() == true` MUST capture `FlushedBaseline(B)`
+    /// (without writing `B` to title memory) so an in-flight `card_merge_relay`
+    /// diffs against `B` rather than stale `self.data` (`A`) and preserves 100%
+    /// of the freshly written 64 KiB DirectStorage data `D`.
+    #[test]
+    fn lazy_copyback_f1_full_cover_written_while_pending_preserves_fresh_data() {
+        use windows_sys::Win32::System::Memory::{
+            FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile,
+        };
+
+        let _guard = LazyTestGuard::enable();
+        let Some(h) = host() else {
+            return;
+        };
+        if !h.card_ready() {
+            return;
+        }
+        let Some(pipe) = GpuAddPipeline::new(h) else {
+            return;
+        };
+        let list = h.new_list().expect("new_list");
+
+        let block = MappedSectionBlock::new(PAGE);
+        // SAFETY: seed initial bytes `A`.
+        unsafe { std::ptr::write_bytes(block.ptr, 0x11, PAGE) };
+        let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+        let shadow_id = shadow.id;
+
+        // Flight 0 writes `B` (`0x6666_0000 ^ i`) and arms `LAZY_DEFERRED` (`self.data` still `0x11`).
+        pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x6666_0000, 1);
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
+        assert_eq!(page_protect(block.addr()), PAGE_NOACCESS);
+
+        // Flight 1 is in flight (`shadow.writes_pending() == true`).
+        shadow.writing(block.addr(), PAGE);
+        assert!(shadow.writes_pending());
+
+        // DirectStorage overwrites all 64 KiB with fresh `D` (`0x7777_0000 + i`)
+        // via an independent writable section mapping while title view is `PAGE_NOACCESS`.
+        // SAFETY: temporary writable view of our live pagefile section.
+        unsafe {
+            let alias = MapViewOfFile(block.section as *mut std::ffi::c_void, FILE_MAP_WRITE, 0, 0, PAGE);
+            assert!(!alias.Value.is_null());
+            let words = std::slice::from_raw_parts_mut(alias.Value.cast::<u32>(), PAGE / 4);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0x7777_0000 + i as u32;
+            }
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: alias.Value });
+        }
+
+        // Notify watch (full 64 KiB cover while `writes_pending() == true`).
+        crate::watch::title_memory_written(block.addr(), PAGE, true);
+        assert_eq!(page_protect(block.addr()), PAGE_READWRITE);
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 0);
+        assert_eq!(shadow.resync_count.load(Ordering::Acquire), 1);
+        {
+            let table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                table.flushed_baselines.contains_key(&(shadow_id, 0)),
+                "full_cover title_memory_written while pending must capture FlushedBaseline"
+            );
+        }
+
+        // Flight 1 lands in `card_merge_relay`: VRAM has Flight 0's `B` everywhere
+        // except dword 0 which Flight 1 updated to `0x9999_0001`.
+        let mut gpu_f1 = vec![0u8; PAGE];
+        for i in 0..PAGE / 4 {
+            let v = if i == 0 { 0x9999_0001 } else { 0x6666_0000u32 ^ i as u32 };
+            gpu_f1[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let mut scratch = Vec::new();
+        let written = shadow.card_merge_relay(0, &gpu_f1, 1, &mut scratch);
+        assert!(written > 0 && written <= 4, "only dword 0 differed from FlushedBaseline(B)");
+
+        // Verify dword 0 got Flight 1's write and all 16,383 remaining dwords
+        // kept DirectStorage's fresh `D` (NOT overwritten with stale Flight 0 `B`!).
+        // SAFETY: page is `PAGE_READWRITE`.
+        unsafe {
+            let words = std::slice::from_raw_parts(block.ptr.cast::<u32>(), PAGE / 4);
+            assert_eq!(words[0], 0x9999_0001);
+            for (i, &w) in words.iter().enumerate().skip(1) {
+                assert_eq!(w, 0x7777_0000 + i as u32, "word {i} must preserve DirectStorage D");
+            }
+        }
+
+        shadow.copy_back_done(&[(block.addr(), block.addr() + PAGE)]);
+        drop(shadow);
+        assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+    }
+
+    /// Regression: `lazy_flush_and_hold` held across `host::copy_mapped`,
+    /// `host::read_into`, and `host::write_mapped` prevents concurrent relay
+    /// `try_defer_piece_relay` from re-arming `PAGE_NOACCESS` mid-access (no
+    /// silent `read_sparse` zero-fills, no spurious `read_into == false`, and no
+    /// dropped `write_mapped` writes).
+    #[test]
+    fn lazy_copyback_host_access_blocks_concurrent_relay_rearm() {
+        use std::sync::atomic::AtomicBool;
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE};
+
+        let _guard = LazyTestGuard::enable();
+        let Some(h) = host() else {
+            return;
+        };
+        if !h.card_ready() {
+            return;
+        }
+        let Some(pipe) = GpuAddPipeline::new(h) else {
+            return;
+        };
+        let list = h.new_list().expect("new_list");
+
+        let block = VirtualBlock::new(PAGE, true);
+        // SAFETY: seed initial bytes so `MEM_WRITE_WATCH` is committed before Frame 1.
+        unsafe { std::ptr::write_bytes(block.ptr, 0x11, PAGE) };
+        let shadow = make_test_shadow(h, block.addr() as u64, PAGE as u64, true).expect("shadow");
+
+        // GPU writes non-zero pattern `0x8888_0000 ^ i` and arms `LAZY_DEFERRED`.
+        pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x8888_0000, 1);
+        assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 1);
+        assert_eq!(page_protect(block.addr()), PAGE_NOACCESS);
+
+        // Deterministic barrier check: while `lazy_flush_and_hold` is live,
+        // concurrent `try_defer_piece_relay` MUST fail to arm.
+        {
+            let _hold = lazy_flush_and_hold(block.addr(), PAGE);
+            assert_eq!(page_protect(block.addr()), PAGE_READWRITE);
+            assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+            assert!(
+                !shadow.try_defer_piece_relay(0, PAGE, 0),
+                "concurrent relay re-arm must be blocked while lazy_flush_and_hold is held"
+            );
+            assert_eq!(page_protect(block.addr()), PAGE_READWRITE);
+        }
+
+        // Concurrent stress: relay thread hammers `try_defer_piece_relay` while
+        // reader/writer exercises `copy_mapped`, `read_into`, and `write_mapped`.
+        pipe.dispatch_on(h, &list, &shadow, 0, PAGE, 0x8888_0000, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let fetched_after = Arc::new(AtomicU64::new(1));
+        let fetched_bg = fetched_after.clone();
+        let shadow_bg = shadow.clone();
+        let bg = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                let fa = fetched_bg.load(Ordering::Acquire);
+                let _ = shadow_bg.try_defer_piece_relay(0, PAGE, fa);
+                std::hint::spin_loop();
+            }
+        });
+
+        let mut dst = vec![0u8; PAGE];
+        let mut rbuf = vec![0u8; PAGE];
+        for iter in 0u32..80 {
+            // Re-enable arming eligibility each iteration so the relay thread
+            // genuinely races `try_defer_piece_relay` against host accessors.
+            let _ = shadow.update(block.addr(), PAGE);
+            let seq = u64::from(iter) + 2;
+            let _ = card_dirty(seq);
+            fetched_after.store(seq, Ordering::Release);
+
+            crate::host::copy_mapped(dst.as_mut_ptr(), block.ptr, PAGE, false);
+            let w0 = u32::from_le_bytes(dst[0..4].try_into().unwrap());
+            assert_ne!(w0, 0, "iter {iter}: copy_mapped must never zero-fill live deferred page");
+
+            assert!(
+                crate::host::read_into(block.ptr, &mut rbuf),
+                "iter {iter}: read_into must never fail due to concurrent relay arming"
+            );
+            let r0 = u32::from_le_bytes(rbuf[0..4].try_into().unwrap());
+            assert_ne!(r0, 0, "iter {iter}: read_into must observe live non-zero bytes");
+
+            let marker = (0xA000_0000u32 | (iter + 1)).to_le_bytes();
+            crate::host::write_mapped(block.ptr, marker.as_ptr(), 4);
+            let mut verify = [0u8; 4];
+            assert!(crate::host::read_into(block.ptr, &mut verify));
+            assert_eq!(verify, marker, "iter {iter}: write_mapped must never drop writes");
+        }
+
+        stop.store(true, Ordering::Release);
+        bg.join().expect("relay stress thread");
+        lazy_flush_range(block.addr(), PAGE);
+        drop(shadow);
         assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
     }
 
