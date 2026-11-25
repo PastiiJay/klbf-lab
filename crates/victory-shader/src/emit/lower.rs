@@ -2951,11 +2951,20 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let off = self.s.m.i32(4 * k);
             let a = self.s.m.bin(c, Bin::Add, addr, off);
+            // The whole dword inside the view: `a < size` and `size - a >= 4`
+            // (not `a + 4 <= size`, which wraps for an offset just under
+            // 4 GiB: the last record of an empty buffer). Only a dword
+            // inside notes a missing page for the host.
+            let before_end = self.s.m.cmp(c, pred::IULT, a, size);
+            let left = self.s.m.bin(c, Bin::Sub, size, a);
+            let four = self.s.m.i32(4);
+            let fits = self.s.m.cmp(c, pred::IUGE, left, four);
+            let inside = self.s.m.bin(c, Bin::And, before_end, fits);
             let lo_k = self.s.m.bin(c, Bin::Add, lo, a);
             let carry = self.s.m.cmp(c, pred::IULT, lo_k, lo);
             let carry = self.s.m.cast(c, Cast::ZExt, carry, i32t);
             let hi_k = self.s.m.bin(c, Bin::Add, hi, carry);
-            let (mh, byte) = self.memory(lo_k, hi_k, None);
+            let (mh, byte) = self.memory(lo_k, hi_k, Some(inside));
             let (mask, u, al) = (self.s.m.i8(1), self.s.m.undef(i32t), self.s.m.i32(4));
             let r = self.s.op(
                 c,
@@ -2967,9 +2976,6 @@ impl<'a> Lower<'a> {
             );
             let x = self.s.m.extract(c, r, 0);
             let x = self.as_int(x);
-            let four = self.s.m.i32(4);
-            let end = self.s.m.bin(c, Bin::Add, a, four);
-            let inside = self.s.m.cmp(c, pred::IULE, end, size);
             let zero = self.s.m.i32(0);
             let x = self.s.m.select(c, inside, x, zero);
             self.write(inst, Reg::S(code + k as u8), x, None);

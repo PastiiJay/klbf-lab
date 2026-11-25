@@ -178,20 +178,42 @@ impl Shader {
     }
 }
 
+/// The shaders whose default form crashes the AMD RDNA 4 compiler
+/// (amdxc64.dll 32.0.32029.2010, RX 9070 XT: a null read at
+/// amdxc64.dll+0x861b9f, which kills the process).
+#[cfg(windows)]
+const RDNA4_OTHER_FORM: &str = "878933b499cfa14d,a567b9ef845fb680,f16876929fa64f9f,c1eee35dbc50a9ef";
+
+/// PCI device IDs of AMD RDNA 4 cards (Navi 48: RX 9070 XT, RX 9070, Radeon
+/// AI PRO R9700; Navi 44: RX 9060 XT, RX 9060), whose compiler the
+/// default form of [`RDNA4_OTHER_FORM`] crashes. Other cards compile it.
+#[cfg(windows)]
+const RDNA4_DEVICES: [u32; 3] = [0x7550, 0x7551, 0x7590];
+
 /// The translator's options for the shader `hash`: the other form of
 /// self-sized loads (`victory_shader::emit::Options::self_sized_loads_via_memory`)
-/// for the compute shaders whose default form crashes the AMD RDNA 4
-/// compiler (amdxc64.dll 32.0.32029.2010, RX 9070 XT: a null read at
-/// amdxc64.dll+0x861b9f, which kills the process), the default for every
-/// other. `VICTORY_OTHER_FORM` names the shaders instead (16-digit hashes,
-/// comma-separated; empty or `0`: none).
+/// for [`RDNA4_OTHER_FORM`] on an AMD RDNA 4 card, the default for every
+/// other shader and on every other card (which compile the default form;
+/// the other form reads title memory, which a page without a copy reads
+/// as 0). `VICTORY_OTHER_FORM` names the shaders instead, on any card
+/// (16-digit hashes, comma-separated; empty or `0`: none).
 #[cfg(windows)]
 fn other_form(hash: &str) -> victory_shader::emit::Options {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_OTHER_FORM").unwrap_or_else(|_| {
-            "878933b499cfa14d,a567b9ef845fb680,f16876929fa64f9f,c1eee35dbc50a9ef".to_owned()
-        });
+        let value = match std::env::var("VICTORY_OTHER_FORM") {
+            Ok(value) => value,
+            Err(_) => {
+                let ids = crate::host::host().and_then(crate::host::Host::adapter_ids);
+                let rdna4 = ids.is_some_and(|(vendor, device)| {
+                    vendor == 0x1002 && RDNA4_DEVICES.contains(&device)
+                });
+                if !rdna4 {
+                    return Vec::new();
+                }
+                RDNA4_OTHER_FORM.to_owned()
+            }
+        };
         if value.trim() == "0" {
             return Vec::new();
         }

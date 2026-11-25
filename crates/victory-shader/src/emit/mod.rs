@@ -327,10 +327,17 @@ pub(crate) fn options() -> Options {
 
 /// [`translate`] with `options`.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
-    let before = OPTIONS.with(|o| o.replace(options));
-    let result = translate(container);
-    OPTIONS.with(|o| o.set(before));
-    result
+    /// Puts the thread's options back, also when the translation panics:
+    /// otherwise the thread's next translation would run with these
+    /// options and be cached as a default one.
+    struct Restore(Options);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OPTIONS.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(OPTIONS.with(|o| o.replace(options)));
+    translate(container)
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
