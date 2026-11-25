@@ -190,12 +190,6 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
-    /// Monotonic sequence of `note_buffer` calls for ordering deferred stale
-    /// invalidations across slot-lock stripes.
-    seq: u64,
-    /// Placed-texture slots marked stale at `seq` and not yet unmade or
-    /// replaced by a newer `note_buffer` call on that slot.
-    pending_stale: std::collections::HashMap<u32, u64>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -306,6 +300,43 @@ impl Spans {
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
+        stale
+    }
+
+    /// The slots (`!= index`) that [`Spans::note`] with `newer == true` would
+    /// mark stale for a view in `[start, end)`, without mutating `self`.
+    fn clashing_slots(&self, index: u32, start: u64, end: u64) -> Vec<u32> {
+        let same = |span: Option<&(u64, std::collections::BTreeSet<u32>)>| {
+            span.is_some_and(|s| s.0 == end)
+        };
+        if (self.by_slot.get(&index) == Some(&start) && same(self.by_start.get(&start)))
+            || end <= start
+            || self.rule == Rule::Never
+        {
+            return Vec::new();
+        }
+        let clashing: Vec<u64> = match self.rule {
+            Rule::Start => self
+                .by_start
+                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .map(|(at, _)| *at)
+                .collect(),
+            Rule::Overlap => self.overlapping(start, end),
+            Rule::Never => return Vec::new(),
+        };
+        let mut stale = Vec::new();
+        for at in clashing {
+            if at == start && same(self.by_start.get(&at)) {
+                continue;
+            }
+            if let Some((_, slots)) = self.by_start.get(&at) {
+                for &slot in slots {
+                    if slot != index {
+                        stale.push(slot);
+                    }
+                }
+            }
+        }
         stale
     }
 
@@ -1445,12 +1476,18 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            // Clear `made[slot]` with Release before rewriting the descriptor
+            // and replacing `kept`, then restore `key` with Release afterwards
+            // so concurrent fast-path readers wait on `_slot_guard` instead of
+            // observing a partially updated slot.
+            self.made[slot as usize].store(0, Ordering::Release);
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 if let Some(old) = self.replace_kept(slot, kept) {
                     displaced.push(old);
                 }
                 remade += 1;
             }
+            self.made[slot as usize].store(key, Ordering::Release);
         }
         Self::retire_all(displaced);
         remade
@@ -1552,8 +1589,20 @@ impl HostHeap {
 
     /// The queue's part of a write of title slot `index` in `frame`:
     /// `texture`, whether it now holds a view of a texture the title may
-    /// fill; `seen` as for [`HostHeap::note_buffer`].
+    /// fill; `seen` as for [`HostHeap::note_buffer_checked`].
+    #[cfg(test)]
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        self.queue_texture_with_stale(index, texture, seen, frame, &[]);
+    }
+
+    fn queue_texture_with_stale(
+        &self,
+        index: u32,
+        texture: bool,
+        seen: bool,
+        frame: u64,
+        stale: &[u32],
+    ) {
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -1574,6 +1623,9 @@ impl HostHeap {
         } else {
             textures.remove(index);
         }
+        for &slot in stale {
+            textures.remove(slot);
+        }
     }
 
     /// The title slots that hold buffer views.
@@ -1589,6 +1641,12 @@ impl HostHeap {
         std::mem::take(&mut *changed).into_iter().collect()
     }
 
+    #[cfg(test)]
+    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_checked(index, view, seen, None)
+            .unwrap_or_default()
+    }
+
     /// Records what title slot `index` now holds for shaders that pick
     /// buffers from the heap: its element stride in the table, and whether
     /// it is a buffer view at all.
@@ -1596,15 +1654,75 @@ impl HostHeap {
     /// host slot from what it held.
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
-    /// slots are the caller's to make null (it holds `made`).
-    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
-        self.note_buffer_tracked(index, view, seen).0
-    }
-
-    fn note_buffer_tracked(&self, index: u32, view: Option<&View>, seen: bool) -> (Vec<u32>, u64) {
+    /// slots are the caller's to make null (it holds the slot stripe locks).
+    /// With `held_stripes = Some(sorted_stripes)`, if a clashing stale slot
+    /// belongs to a stripe not in `held_stripes`, returns `Err(missing_stripes)`
+    /// before mutating `placed`, `textures`, `strides`, `buffers`, or `changed`.
+    fn note_buffer_checked(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        held_stripes: Option<&[usize]>,
+    ) -> Result<Vec<u32>, Vec<usize>> {
         if self.sampler {
-            return (Vec::new(), 0);
+            return Ok(Vec::new());
         }
+        let frame = crate::frame::current();
+        // The memory a placed texture view describes. Not for a slot
+        // tables read (thousands of writes a frame, each read by its
+        // draw): no pass looks at it, and the same texture's view in a
+        // slot shaders pick by index says what it says.
+        let placed_view = match view {
+            Some(View::Placed(false, resource, desc))
+                if resource[0] != 1 && !self.tabled_lately(index, frame) =>
+            {
+                // (And the level the view starts at: word 4 of a texture
+                // view's description, after format, dimension, mapping
+                // and a pad.)
+                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[4]))
+            }
+            _ => None,
+        };
+        let stale = {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            let span = placed_view.and_then(|(resource, start, first)| {
+                Some((start, start.saturating_add(placed.bytes(resource)?), first))
+            });
+            match span {
+                Some((start, end, first)) => {
+                    placed.rule = stale_rule();
+                    if !seen && let Some(held) = held_stripes {
+                        let missing: Vec<usize> = placed
+                            .clashing_slots(index, start, end)
+                            .into_iter()
+                            .map(Self::stripe)
+                            .filter(|s| held.binary_search(s).is_err())
+                            .collect();
+                        if !missing.is_empty() {
+                            return Err(missing);
+                        }
+                    }
+                    SPANNED[0].fetch_min(start, Relaxed);
+                    SPANNED[1].fetch_max(end, Relaxed);
+                    let stale = placed.note(index, start, end, !seen);
+                    placed.shows(index, first);
+                    if let Some(held) = held_stripes {
+                        debug_assert!(
+                            stale.iter().all(|&st| st == index
+                                || held.binary_search(&Self::stripe(st)).is_ok()),
+                            "all stale slots must be covered by held stripes"
+                        );
+                    }
+                    stale
+                }
+                None => {
+                    placed.forget(index);
+                    Vec::new()
+                }
+            }
+        };
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
         // uploaded): slots written with a placed texture view, and with a
@@ -1620,60 +1738,9 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
-        // The memory a placed texture view describes. Not for a slot
-        // tables read (thousands of writes a frame, each read by its
-        // draw): no pass looks at it, and the same texture's view in a
-        // slot shaders pick by index says what it says.
-        let placed_view = match view {
-            Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
-            {
-                // (And the level the view starts at: word 4 of a texture
-                // view's description, after format, dimension, mapping
-                // and a pad.)
-                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[4]))
-            }
-            _ => None,
-        };
-        let (stale, op_seq) = {
-            use std::sync::atomic::Ordering::Relaxed;
-            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            placed.seq = placed.seq.wrapping_add(1).max(1);
-            let op_seq = placed.seq;
-            if !placed.pending_stale.is_empty() {
-                placed.pending_stale.remove(&index);
-            }
-            let span = placed_view.and_then(|(resource, start, first)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first))
-            });
-            let stale = match span {
-                Some((start, end, first)) => {
-                    SPANNED[0].fetch_min(start, Relaxed);
-                    SPANNED[1].fetch_max(end, Relaxed);
-                    placed.rule = stale_rule();
-                    let stale = placed.note(index, start, end, !seen);
-                    placed.shows(index, first);
-                    for &st in &stale {
-                        if st != index {
-                            placed.pending_stale.insert(st, op_seq);
-                        }
-                    }
-                    stale
-                }
-                None => {
-                    placed.forget(index);
-                    Vec::new()
-                }
-            };
-            (stale, op_seq)
-        };
+        self.queue_texture_with_stale(index, texture, seen, frame, &stale);
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            for &slot in &stale {
-                textures.remove(slot);
-            }
         }
         let stride = view.and_then(view_stride);
         if let Some((_, _, data)) = &self.strides
@@ -1696,7 +1763,7 @@ impl HostHeap {
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index);
         }
-        (stale, op_seq)
+        Ok(stale)
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -1752,14 +1819,6 @@ impl HostHeap {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn try_slot_lock(&self, stripe: usize) -> Option<std::sync::MutexGuard<'_, ()>> {
-        match self.slot_locks[stripe].0.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
     }
 
     fn kept_slot(&self, index: u32) -> Option<(usize, usize)> {
@@ -1989,49 +2048,6 @@ impl HostHeap {
         true
     }
 
-    /// Unmakes any stale placed-texture slots invalidated at `op_seq` whose
-    /// lower stripe lock was contended while holding `slot_lock(index)`.
-    fn unmake_deferred(&self, mut deferred: Vec<(usize, u32)>, op_seq: u64) {
-        if deferred.is_empty() || op_seq == 0 {
-            return;
-        }
-        deferred.sort_unstable();
-        deferred.dedup();
-        let mut displaced = Vec::new();
-        let mut i = 0;
-        while i < deferred.len() {
-            let stripe = deferred[i].0;
-            let start = i;
-            while i < deferred.len() && deferred[i].0 == stripe {
-                i += 1;
-            }
-            let _slot_guard = self.slot_locks[stripe]
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let due: Vec<u32> = {
-                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-                deferred[start..i]
-                    .iter()
-                    .filter_map(|&(_, slot)| {
-                        if placed.pending_stale.get(&slot) == Some(&op_seq) {
-                            placed.pending_stale.remove(&slot);
-                            Some(slot)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-            for slot in due {
-                if let Some(old) = self.unmake_locked(slot) {
-                    displaced.push(old);
-                }
-            }
-        }
-        Self::retire_all(displaced);
-    }
-
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -2065,93 +2081,66 @@ impl HostHeap {
             return Some(view);
         }
 
-        let slot_guard = self.slot_lock(index);
-        // Re-read the title slot under the stripe lock in case another writer
-        // updated both the slot and `made[index]` while we waited.
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        let key = u64::from(generation) << 32 | u64::from(i);
-        let old_key = self.made[index as usize].load(Ordering::Acquire);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
-            if old_key != 0 {
-                self.made[index as usize].store(0, Ordering::Release);
-                let displaced = self.make_null_keeping(index);
-                let _ = self.note_buffer(index, None, false);
-                drop(slot_guard);
-                if let Some(old) = displaced {
-                    crate::host::retire(old);
+        let mut needed_stripes = vec![Self::stripe(index)];
+        let (guards, view, key, old_key, stale) = loop {
+            let guards: Vec<_> = needed_stripes
+                .iter()
+                .map(|&stripe| {
+                    self.slot_locks[stripe]
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                })
+                .collect();
+            // Re-read the title slot under the stripe locks in case another writer
+            // updated both the slot and `made[index]` while we waited.
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            let old_key = self.made[index as usize].load(Ordering::Acquire);
+            let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+            let Some(view) = view else {
+                // Not a view of ours (never written, or of a resource the
+                // title released): nothing to read.
+                if old_key != 0 {
+                    self.made[index as usize].store(0, Ordering::Release);
+                    let displaced = self.make_null_keeping(index);
+                    let _ = self.note_buffer_checked(index, None, false, Some(&needed_stripes));
+                    drop(guards);
+                    if let Some(old) = displaced {
+                        crate::host::retire(old);
+                    }
+                } else if for_draw {
+                    // Left for later and stale since: out of the sets and the stride table.
+                    let _ = self.note_buffer_checked(index, None, false, Some(&needed_stripes));
                 }
-            } else if for_draw {
-                // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
+                return None;
+            };
+            if old_key == key {
+                return Some(view);
             }
-            return None;
+            match self.note_buffer_checked(index, Some(&view), for_draw, Some(&needed_stripes)) {
+                Ok(stale) => break (guards, view, key, old_key, stale),
+                Err(missing) => {
+                    drop(guards);
+                    needed_stripes.extend(missing);
+                    needed_stripes.sort_unstable();
+                    needed_stripes.dedup();
+                }
+            }
         };
-        if old_key == key {
-            return Some(view);
-        }
+
         // Views of other textures in the memory this one describes are stale:
         // their host slots read nothing from here on, and let go of the host
-        // copies they held. Acquire other stripes strictly in ascending order
-        // (and use `try_lock` for lower stripes, deferring contended ones) so
-        // cross-stripe invalidations can never AB-BA deadlock.
-        let (stale, op_seq) = self.note_buffer_tracked(index, Some(&view), for_draw);
-        let s0 = Self::stripe(index);
+        // copies they held. Every stale slot's stripe lock is already held in
+        // `guards` in ascending stripe order, eliminating AB-BA deadlocks and
+        // concurrent overwrite races between `note_buffer` and `unmake`.
         let mut displaced = Vec::new();
-        let mut unmade_sync = Vec::new();
-        let mut deferred = Vec::new();
-        if !stale.is_empty() {
-            let mut higher: Vec<(usize, u32)> = Vec::new();
-            for st in stale {
-                if st == index {
-                    continue;
-                }
-                let stripe = Self::stripe(st);
-                if stripe == s0 {
-                    if let Some(old) = self.unmake_locked(st) {
-                        displaced.push(old);
-                    }
-                    unmade_sync.push(st);
-                } else if stripe < s0 {
-                    if let Some(_g) = self.try_slot_lock(stripe) {
-                        if let Some(old) = self.unmake_locked(st) {
-                            displaced.push(old);
-                        }
-                        unmade_sync.push(st);
-                    } else {
-                        deferred.push((stripe, st));
-                    }
-                } else {
-                    higher.push((stripe, st));
-                }
-            }
-            higher.sort_unstable();
-            let mut h_idx = 0;
-            while h_idx < higher.len() {
-                let stripe = higher[h_idx].0;
-                let _g = self.slot_locks[stripe]
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                while h_idx < higher.len() && higher[h_idx].0 == stripe {
-                    let st = higher[h_idx].1;
-                    if let Some(old) = self.unmake_locked(st) {
-                        displaced.push(old);
-                    }
-                    unmade_sync.push(st);
-                    h_idx += 1;
-                }
-            }
-            if !unmade_sync.is_empty() && op_seq != 0 {
-                let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-                for st in unmade_sync {
-                    if placed.pending_stale.get(&st) == Some(&op_seq) {
-                        placed.pending_stale.remove(&st);
-                    }
-                }
+        for st in stale {
+            if st != index
+                && let Some(old) = self.unmake_locked(st)
+            {
+                displaced.push(old);
             }
         }
         // A view of a texture object that has no host copy yet waits
@@ -2177,9 +2166,8 @@ impl HostHeap {
                 .is_some_and(|old| same_placed_texture(&old, &view))
         {
             KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(slot_guard);
+            drop(guards);
             Self::retire_all(displaced);
-            self.unmake_deferred(deferred, op_seq);
             return Some(view);
         }
         if old_key != 0 {
@@ -2199,9 +2187,8 @@ impl HostHeap {
         if !later {
             self.made[index as usize].store(key, Ordering::Release);
         }
-        drop(slot_guard);
+        drop(guards);
         Self::retire_all(displaced);
-        self.unmake_deferred(deferred, op_seq);
         Some(view)
     }
 
@@ -4039,10 +4026,118 @@ mod tests {
         });
         // SAFETY: plain device query.
         assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
-        assert!(
-            heap.placed.lock().unwrap().pending_stale.is_empty(),
-            "all deferred stale invalidations must drain cleanly"
-        );
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(host_gpu.log_messages(), None);
+    }
+
+    #[test]
+    fn concurrent_stale_invalidation_and_cbv_overwrite_never_clobbers_live_slot() {
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 512) else {
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            let _ = host_gpu.log_messages();
+        }
+        let fixture = StressFixture::new(16);
+        let tex_addr = fixture.base + 0x40_0000_0000;
+        fixture.write_cbv(0, 0, 256);
+        fixture.write_placed_tex(1, tex_addr, 64);
+        fixture.write_placed_tex(2, tex_addr, 128);
+        let zero_slot = [0u32; 8];
+        let zero_handle = (&raw const zero_slot) as u64;
+
+        for round in 0..500usize {
+            // Alternate low-vs-high stripe ordering (`10 > 2` and `3 < 300`).
+            let (tex_slot, clash_slot) = if round.is_multiple_of(2) {
+                (10u32, 2u32)
+            } else {
+                (3u32, 300u32)
+            };
+            assert!(heap.mirror(tex_slot, fixture.handle(1), false).is_some());
+            assert!(heap.mirror(tex_slot, fixture.handle(1), true).is_some());
+            assert!(heap.made(tex_slot));
+
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                let (heap, fixture, barrier) = (&heap, &fixture, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    assert!(heap.mirror(tex_slot, fixture.handle(0), true).is_some());
+                });
+                s.spawn(move || {
+                    barrier.wait();
+                    assert!(heap.mirror(clash_slot, fixture.handle(2), false).is_some());
+                });
+            });
+            // Regardless of thread order, `tex_slot` was overwritten with a CBV
+            // either after or before `clash_slot`'s stale check, so the live CBV
+            // must NEVER be wiped out by a delayed cross-stripe unmake.
+            assert!(
+                heap.made(tex_slot) && heap.has_kept(tex_slot),
+                "round {round}: live CBV on slot {tex_slot} was clobbered"
+            );
+            // Reset both slots (including `placed` state) for the next round.
+            assert!(heap.mirror(tex_slot, zero_handle, true).is_none());
+            assert!(heap.mirror(clash_slot, zero_handle, true).is_none());
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(host_gpu.log_messages(), None);
+    }
+
+    #[test]
+    fn concurrent_texture_views_remade_and_fast_path_stay_consistent() {
+        let Some(host_gpu) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            let _ = host_gpu.log_messages();
+        }
+        let fixture = StressFixture::new(4);
+        let tex_addr = fixture.base + 0x50_0000_0000;
+        fixture.write_placed_tex(0, tex_addr, 64);
+        assert!(heap.mirror(5, fixture.handle(0), false).is_some());
+        assert!(heap.mirror(5, fixture.handle(0), true).is_some());
+        // SAFETY: `fixture.handle(0)` holds `[VIEW_TAG, i, generation]`.
+        let [_, i, generation] =
+            unsafe { (fixture.handle(0) as *const [u32; 3]).read_unaligned() };
+        let expected_key = u64::from(generation) << 32 | u64::from(i);
+
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            let (heap, fixture, barrier) = (&heap, &fixture, &barrier);
+            s.spawn(move || {
+                barrier.wait();
+                for _ in 0..300 {
+                    levels_changed(tex_addr);
+                    let _ = heap.texture_views_remade();
+                }
+            });
+            for _ in 0..7 {
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..600 {
+                        let loaded = heap.made[5].load(Ordering::Acquire);
+                        if loaded == expected_key {
+                            assert!(heap.has_kept(5), "kept missing while made[5] == key");
+                        }
+                        assert!(heap.mirror(5, fixture.handle(0), true).is_some());
+                    }
+                });
+            }
+        });
+        assert!(heap.made(5) && heap.has_kept(5));
+        // SAFETY: plain device query.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
         #[cfg(feature = "diagnostics")]
         assert_eq!(host_gpu.log_messages(), None);
     }
@@ -4121,7 +4216,6 @@ mod tests {
         assert!(!heap.has_kept(300));
         assert!(heap.mirror(2, fixture.handle(3), true).is_some());
         assert!(heap.made(2));
-        assert!(heap.placed.lock().unwrap().pending_stale.is_empty());
 
         // `mirror_copied` skips zero records without allocating `copied`, mirrors
         // changed non-zero records, skips identical repeats, and nulls on clear.
