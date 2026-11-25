@@ -91,12 +91,26 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one.
-pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+/// The translation of a console shader container with `options`, from
+/// the cache when there is one (a translation with other than the default
+/// options is cached apart from the default one).
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+) -> Result<HostShader, String> {
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let key = if options == victory_shader::emit::Options::default() {
+        build()
+    } else {
+        let mut h = blake3::Hasher::new();
+        h.update(&build());
+        h.update(b"self_sized_loads_via_memory");
+        h.update(&[options.self_sized_loads_via_memory as u8]);
+        *h.finalize().as_bytes()
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &key, container, translate),
         None => translate(container),
     }
 }

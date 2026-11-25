@@ -141,7 +141,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, other_form(&self.hash));
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -178,8 +178,42 @@ impl Shader {
     }
 }
 
+/// The translator's options for the shader `hash`: the other form of
+/// self-sized loads (`victory_shader::emit::Options::self_sized_loads_via_memory`)
+/// for the compute shaders whose default form crashes the AMD RDNA 4
+/// compiler (amdxc64.dll 32.0.32029.2010, RX 9070 XT: a null read at
+/// amdxc64.dll+0x861b9f, which kills the process), the default for every
+/// other. `VICTORY_OTHER_FORM` names the shaders instead (16-digit hashes,
+/// comma-separated; empty or `0`: none).
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn other_form(hash: &str) -> victory_shader::emit::Options {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_OTHER_FORM").unwrap_or_else(|_| {
+            "878933b499cfa14d,a567b9ef845fb680,f16876929fa64f9f,c1eee35dbc50a9ef".to_owned()
+        });
+        if value.trim() == "0" {
+            return Vec::new();
+        }
+        let hashes: Vec<String> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|hash| hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        tracing::info!(?hashes, "shaders translated in the other form of self-sized loads");
+        hashes
+    });
+    victory_shader::emit::Options {
+        self_sized_loads_via_memory: hashes.iter().any(|h| h == hash),
+    }
+}
+
+#[cfg(windows)]
+fn translate(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -188,7 +222,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = crate::shader_cache::host_shader_with(container, options)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

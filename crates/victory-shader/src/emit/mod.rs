@@ -295,6 +295,44 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// Choices a translation can be made with, per shader: the host asks for
+/// another form where the default one fails on its driver. The default
+/// (`Options::default()`) is what [`translate`] makes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// A scalar load from a buffer at an offset computed from that same
+    /// buffer's record count (the console's "last record" idiom,
+    /// `buf[(size / stride - 1) * stride]`) reads the bytes at the view's
+    /// address through title memory instead of through the view; past
+    /// the view's end it reads 0, as the console's load does. The RX 9070
+    /// XT's compiler (amdxc64.dll 32.0.32029.2010) crashes the process on
+    /// some programs with the load through the view (a null read at
+    /// amdxc64.dll+0x861b9f; four of the title's compute shaders), and
+    /// compiles them with the load through title memory. 322 of the
+    /// title's 25,652 programs have such a load and compile as they are,
+    /// so this is asked for only where the default form crashes.
+    pub self_sized_loads_via_memory: bool,
+}
+
+thread_local! {
+    static OPTIONS: std::cell::Cell<Options> = const {
+        std::cell::Cell::new(Options { self_sized_loads_via_memory: false })
+    };
+}
+
+/// The options of the translation running on this thread.
+pub(crate) fn options() -> Options {
+    OPTIONS.with(std::cell::Cell::get)
+}
+
+/// [`translate`] with `options`.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    let before = OPTIONS.with(|o| o.replace(options));
+    let result = translate(container);
+    OPTIONS.with(|o| o.set(before));
+    result
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
