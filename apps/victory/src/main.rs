@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod lowspec;
 #[cfg(windows)]
 mod prebuild;
 mod run;
@@ -111,9 +112,11 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// The console model the title sees (device type, memory). Not
+        /// given: series-s on a PC with less than 24 GB of memory, else
+        /// series-x.
+        #[arg(long, value_enum)]
+        console: Option<Console>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -133,6 +136,34 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+/// The console the title runs as, and for the Series S profile an upscaler
+/// that is there (see [`lowspec`]); says what was picked and why.
+fn low_spec(chosen: Option<Console>) -> Console {
+    let (console, why) = lowspec::console(chosen, lowspec::physical_memory());
+    let name = match console {
+        Console::SeriesX => "series-x",
+        Console::SeriesS => "series-s",
+    };
+    println!("console        {name} ({why})");
+    let ffx_dir = std::env::var_os("VICTORY_FFX_DIR").map(PathBuf::from);
+    let simple_set = std::env::var_os("VICTORY_FFX_SIMPLE").is_some();
+    match lowspec::upscaler(console, ffx_dir.as_deref(), simple_set) {
+        lowspec::Upscaler::AsSet => {}
+        lowspec::Upscaler::Amd => println!("upscaler       AMD FidelityFX (VICTORY_FFX_DIR)"),
+        lowspec::Upscaler::Simple => {
+            println!(
+                "upscaler       bilinear stand-in: no {} in VICTORY_FFX_DIR (AMD's FidelityFX SDK \
+                 2.4.0, its Kits\\FidelityFX\\signedbin folder, upscales better)",
+                lowspec::FFX_LOADER
+            );
+            // SAFETY: set before the title or any thread of ours starts;
+            // read once, by the GPU back end, when the title upscales.
+            unsafe { std::env::set_var("VICTORY_FFX_SIMPLE", "1") };
+        }
+    }
+    console
 }
 
 fn parse_jobs(value: &str) -> std::result::Result<usize, std::num::ParseIntError> {
@@ -200,7 +231,10 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let console = low_spec(console);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
