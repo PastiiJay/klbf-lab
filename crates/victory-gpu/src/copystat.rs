@@ -765,14 +765,20 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    let lightened = crate::texture::lightened();
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
-         {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
+         {:.0} MB, {} staging buffers of unchanged textures {:.0} MB ({} made again, {:.0} MB); \
+         of the windows alive, {:.0} MB lie between the lowest and highest address asked for in \
+         each",
         windows[0],
         mb(windows[1]),
         stagings[0],
         mb(stagings[1]),
+        lightened[0],
+        mb(lightened[1]),
+        lightened[2],
+        mb(lightened[3]),
         mb(windows[2]),
     );
     tracing::info!(
