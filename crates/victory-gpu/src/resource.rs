@@ -2209,11 +2209,11 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
             if !fills(&r.desc) || crate::texture::host_wrote(at) {
                 continue;
             }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let last_used = r.host.used.load(Relaxed);
             if !is_idle_at(now, last_used, plan.idle_ms, plan.idle_frames) {
                 continue;
             }
-            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((host, _)) = made.as_ref()
                 && std::sync::Arc::strong_count(host) == 1
                 && crate::host::references(&host.texture) > 1
@@ -2235,11 +2235,11 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
     candidates.sort_unstable_by_key(|&(last_used, _, _, _)| last_used);
 
     let mut victim_ptrs = std::collections::HashSet::new();
-    let mut victim_resources = Vec::new();
+    let mut victim_resources: Vec<(usize, usize)> = Vec::new();
     let mut selected = 0u64;
     for (_, at, raw, bytes) in candidates {
         victim_ptrs.insert(raw);
-        victim_resources.push(at);
+        victim_resources.push((at, raw));
         selected += bytes;
         if selected >= plan.target_bytes {
             break;
@@ -2252,15 +2252,15 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
     }
 
     // Pass 2: now that descriptor heaps released their COM references (and no
-    // submission is in flight), free every victim whose refcount dropped to 1,
-    // retiring all COM objects only after dropping `made`, `STAGING`, and
-    // `TEXTURES`.
+    // submission is in flight), re-verify under `r.host.made` that no
+    // recording thread touched, host-wrote, or recreated each victim between
+    // Pass 1 and Pass 2 before taking and retiring it outside all locks.
     let (mut freed, mut freed_bytes) = (0u64, 0u64);
     let mut retired_hosts: Vec<std::sync::Arc<HostTexture>> = Vec::new();
     let mut retired_staging: Vec<std::sync::Arc<crate::texture::Staging>> = Vec::new();
     {
         let all = textures();
-        for at in victim_resources {
+        for (at, expected_raw) in victim_resources {
             if !all.contains(&at) {
                 continue;
             }
@@ -2268,10 +2268,13 @@ fn evict_lru_textures_at(plan: EvictionPlan, now: u64) -> (u64, u64, u64) {
             let r = unsafe { &*(at as *const Resource) };
             let (gone, staged) = {
                 let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-                let ready = made.as_ref().is_some_and(|(host, _)| {
-                    std::sync::Arc::strong_count(host) == 1
-                        && crate::host::references(&host.texture) == 1
-                });
+                let ready = !crate::texture::host_wrote(at)
+                    && is_idle_at(now, r.host.used.load(Relaxed), plan.idle_ms, plan.idle_frames)
+                    && made.as_ref().is_some_and(|(host, _)| {
+                        windows::core::Interface::as_raw(&host.texture) as usize == expected_raw
+                            && std::sync::Arc::strong_count(host) == 1
+                            && crate::host::references(&host.texture) == 1
+                    });
                 if ready {
                     let staged = crate::texture::take_staged(at as This);
                     (made.take(), staged)

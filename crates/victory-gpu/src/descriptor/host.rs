@@ -1956,16 +1956,24 @@ impl HostHeap {
     /// Unpins any title slots currently viewing a resource whose raw COM
     /// pointer is in `victims`, replacing them with a valid D3D12 null SRV so
     /// the evicted host texture can be freed safely without GPU page faults.
+    /// Appends removed COM references to `removed` so the caller retires them
+    /// after dropping all locks (including `SHADER_HEAPS`).
     /// Must only be called when no GPU submission is in flight (`sweep`).
-    pub(crate) fn evict_kept(&self, victims: &std::collections::HashSet<usize>) -> u64 {
+    pub(crate) fn evict_kept(
+        &self,
+        victims: &std::collections::HashSet<usize>,
+        removed: &mut Vec<ID3D12Resource>,
+    ) -> u64 {
         if self.sampler || victims.is_empty() {
             return 0;
         }
         let mut evicted_slots: Vec<u32> = Vec::new();
-        let mut removed_objs: Vec<ID3D12Resource> = Vec::new();
+        // Hold `made` across `kept`, `placed`, and `textures` cleanup so a
+        // concurrent `mirror()` cannot rewrite a freshly-evicted slot before
+        // `placed.forget` / `textures.remove` run (same lock order as `mirror`:
+        // `made` -> `kept`, `made` -> `placed`, `made` -> `textures`).
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         {
-            // Lock order matches `mirror` and `texture_slot_gone`: `made` before `kept`.
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             let limit = (self.count as usize).min(kept.len()).min(made.len());
             for (i, slot) in kept[..limit].iter_mut().enumerate() {
@@ -1982,7 +1990,7 @@ impl HostHeap {
                         None => null_view(self.cpu(index)),
                     }
                     if let Some(old) = slot.take() {
-                        removed_objs.push(old);
+                        removed.push(old);
                     }
                     evicted_slots.push(index);
                 }
@@ -2002,11 +2010,7 @@ impl HostHeap {
                 }
             }
         }
-        let total = evicted_slots.len() as u64;
-        for old in removed_objs {
-            crate::host::retire(old);
-        }
-        total
+        evicted_slots.len() as u64
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

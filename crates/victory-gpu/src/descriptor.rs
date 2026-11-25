@@ -281,14 +281,23 @@ pub(crate) fn evict_kept_resources(victims: &std::collections::HashSet<usize>) -
     if victims.is_empty() {
         return 0;
     }
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let mut cleared = 0u64;
-    for &(_, _, h) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed in `Drop for Heap` under
-        // the same `SHADER_HEAPS` lock).
-        if let Some(Some(host)) = unsafe { &*(h as *const Heap) }.host.get() {
-            cleared += host.evict_kept(victims);
+    let mut removed = Vec::new();
+    let cleared = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cleared = 0u64;
+        for &(_, _, h) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed in `Drop for Heap` under
+            // the same `SHADER_HEAPS` lock).
+            if let Some(Some(host)) = unsafe { &*(h as *const Heap) }.host.get() {
+                cleared += host.evict_kept(victims, &mut removed);
+            }
         }
+        cleared
+    };
+    // Retire COM references only after dropping `SHADER_HEAPS` and all heap
+    // locks so synchronous `ID3D12Resource::Release()` never runs under lock.
+    for old in removed {
+        crate::host::retire(old);
     }
     cleared
 }

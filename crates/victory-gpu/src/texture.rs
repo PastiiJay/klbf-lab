@@ -828,11 +828,18 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
-        list.defer_texture(staging);
+        // Clear `copy_queued` immediately afterwards so a second upload list
+        // in the same submission (whose `Step::Texture` is deduplicated) never
+        // leaves `copy_queued == true` for a later skipped-upload submission.
+        list.defer_texture(staging.clone());
+        list.defer_host(move || {
+            staging.copy_queued.store(false, Relaxed);
+        });
         return;
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
+        staging.copy_queued.store(false, Relaxed);
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
@@ -1879,5 +1886,87 @@ mod staging_trim_tests {
         crate::resource::tests::test_release_resource(one_shot_idle);
         crate::resource::tests::test_release_resource(dirty_unflushed);
         crate::resource::tests::test_release_resource(in_flight_clean);
+    }
+
+    /// Two upload lists for the same texture in one submission must not leave
+    /// `copy_queued == true` (when list 2's `Step::Texture` is deduplicated),
+    /// so a subsequent skipped-upload detile still marks `unflushed = true`
+    /// and is preserved by pressure trim.
+    #[test]
+    fn multi_list_upload_does_not_leave_stale_copy_queued_for_next_skipped_refresh() {
+        let _serial = crate::resource::tests::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+
+        let tex_res = crate::resource::tests::test_committed_texture_2d(64, 64, 28);
+        let fill_memory = |byte: u8| {
+            let (ptr, desc) = crate::resource::texture_memory(tex_res).unwrap();
+            let size = crate::resource::texture_layout(&desc).unwrap().size as usize;
+            // SAFETY: committed resource memory owned exclusively by this test.
+            unsafe { std::ptr::write_bytes(ptr.cast_mut(), byte, size) };
+        };
+        fill_memory(0x11);
+
+        // Submission 1: two lists both record an upload (`CopyTextureRegion`)
+        // for `tex_res` in the same `execute(&[&list_a, &list_b])` call.
+        {
+            let list_a = host.new_list().expect("list_a");
+            let list_b = host.new_list().expect("list_b");
+            let tex = crate::resource::host_resource(tex_res).unwrap();
+            super::upload(&list_a, tex_res, tex);
+            super::upload(&list_b, tex_res, tex);
+            list_a.close();
+            list_b.close();
+            host.execute(&[&list_a, &list_b]);
+        }
+        // `copy_queued` must be cleared after the multi-list submission.
+        {
+            let map = super::STAGING.lock().unwrap();
+            let s = map.as_ref().unwrap().get(&(tex_res as usize)).unwrap();
+            assert!(
+                !s.copy_queued.load(Relaxed),
+                "copy_queued must not remain set after a multi-list upload submission"
+            );
+        }
+        // Submission 2 (unchanged memory): clears `dirty` so Submission 3 takes
+        // the skipped-upload (`uploaded && !dirty`, no `CopyTextureRegion`) path.
+        {
+            let list = host.new_list().expect("list_clean");
+            let tex = crate::resource::host_resource(tex_res).unwrap();
+            super::upload(&list, tex_res, tex);
+            list.close();
+            host.execute(&[&list]);
+        }
+        // Submission 3: mutate memory and submit a skipped-upload list.
+        fill_memory(0x55);
+        {
+            let list = host.new_list().expect("list_skipped");
+            let tex = crate::resource::host_resource(tex_res).unwrap();
+            super::upload(&list, tex_res, tex);
+            list.close();
+            host.execute(&[&list]);
+        }
+        {
+            let map = super::STAGING.lock().unwrap();
+            let s = map.as_ref().unwrap().get(&(tex_res as usize)).unwrap();
+            assert!(
+                s.dirty.load(Relaxed) && s.unflushed.load(Relaxed),
+                "skipped-upload detile after multi-list upload must mark unflushed = true"
+            );
+            s.used.store((10u64 << 32) | 100, Relaxed);
+        }
+        let now = (100u64 << 32) | 300;
+        {
+            let _idle = host.test_sweep_lock();
+            let _ = super::trim_idle_under_pressure_at(1_000, 4, now);
+        }
+        assert!(
+            super::is_staged(tex_res),
+            "unflushed staging after multi-list upload must not be dropped by pressure trim"
+        );
+        crate::resource::tests::test_release_resource(tex_res);
     }
 }
