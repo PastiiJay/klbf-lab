@@ -29,9 +29,10 @@ use crate::texture::{
 };
 
 /// Subresource active byte threshold above which strip work is fanned out
-/// across the persistent worker pool. Smaller mips stay inline to avoid wake
-/// latency.
-const PARALLEL_MIN_BYTES: usize = 512 * 1024;
+/// across the persistent worker pool. Subresources under 2 MiB (e.g., 1 MiB
+/// 1K BC7 mips) run inline so thread-pool wake/join latency does not outweigh
+/// parallel gain on high-core / virtualized CPUs.
+const PARALLEL_MIN_BYTES: usize = 2 * 1024 * 1024;
 
 /// Which 256-byte micro-tile byte permutation applies to a thin tiled layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
