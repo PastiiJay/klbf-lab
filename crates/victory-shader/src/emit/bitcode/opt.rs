@@ -6663,4 +6663,846 @@ mod tests {
             }
         }
     }
+
+    /// What the memory passes ([`LOADS`], the loads [`LICM`] hoists) and
+    /// [`BARRIERS`] change, checked on random programs that have memory and
+    /// barriers, which `random_program` does not make. A program has two
+    /// private arrays and two LDS arrays, and barriers at its top level only
+    /// (so every thread meets the same ones). It is run by a group of four
+    /// threads that can stop after any instruction, under several schedules.
+    /// The LDS accesses are race free by construction: between two barriers
+    /// each LDS array is only written at the thread's own slots, only used
+    /// at its own slots, or only read. So the plain program gives the same
+    /// result under every schedule, and an optimised one must too. A barrier
+    /// dropped where it was needed lets one schedule see another thread's
+    /// store early, and the results part.
+    ///
+    /// Not covered: the fence bits on their own (a barrier with the group
+    /// sync bit is taken as making every store visible), barriers inside
+    /// divergent control flow, and float arithmetic.
+    mod thread_group {
+        use super::*;
+        use std::collections::HashMap;
+
+        const T: usize = 4;
+        const LDS_LEN: u64 = 16;
+        const PRIV_LEN: u64 = 8;
+
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Role {
+            Write,
+            Read,
+            Own,
+        }
+
+        struct G {
+            k: Kit,
+            rng: u64,
+            regs: Vec<V>,
+            conds: Vec<V>,
+            cur: usize,
+            input: V,
+            tid: V,
+            barrier: V,
+            pa: V,
+            pb: V,
+            lds: V,
+            lds2: V,
+            role: Role,
+            role2: Role,
+        }
+
+        impl G {
+            fn next(&mut self, n: u64) -> u64 {
+                self.rng ^= self.rng << 13;
+                self.rng ^= self.rng >> 7;
+                self.rng ^= self.rng << 17;
+                (self.rng >> 11) % n
+            }
+            fn reg(&mut self) -> V {
+                let n = self.next(self.regs.len() as u64) as usize;
+                self.regs[n]
+            }
+            fn value(&mut self) -> V {
+                if self.next(4) == 0 {
+                    let k = [0u32, 1, 2, 3, 31, u32::MAX, 7][self.next(7) as usize];
+                    self.k.m.i32(k)
+                } else {
+                    self.reg()
+                }
+            }
+            fn cond(&mut self) -> V {
+                if !self.conds.is_empty() && self.next(3) == 0 {
+                    let n = self.next(self.conds.len() as u64) as usize;
+                    return self.conds[n];
+                }
+                let p = pred::EQ + self.next(10) as u8;
+                let (x, y) = (self.reg(), self.value());
+                let c = self.k.m.cmp(self.cur, p, x, y);
+                self.conds.push(c);
+                c
+            }
+            /// An index into a private array: constant, or a register masked.
+            fn priv_index(&mut self) -> V {
+                if self.next(2) == 0 {
+                    let k = self.next(PRIV_LEN) as u32;
+                    self.k.m.i32(k)
+                } else {
+                    let r = self.reg();
+                    let m = self.k.m.i32((PRIV_LEN - 1) as u32);
+                    self.k.m.bin(self.cur, Bin::And, r, m)
+                }
+            }
+            /// A slot of this thread's own in an LDS array: tid + 4 * k.
+            fn own_slot(&mut self) -> V {
+                let k = self.next(LDS_LEN / T as u64) as u32 * T as u32;
+                let k = self.k.m.i32(k);
+                self.k.m.bin(self.cur, Bin::Add, self.tid, k)
+            }
+            /// Any LDS slot (only read in a read phase).
+            fn any_slot(&mut self) -> V {
+                if self.next(2) == 0 {
+                    let k = self.next(LDS_LEN) as u32;
+                    self.k.m.i32(k)
+                } else {
+                    let r = self.reg();
+                    let m = self.k.m.i32((LDS_LEN - 1) as u32);
+                    self.k.m.bin(self.cur, Bin::And, r, m)
+                }
+            }
+            fn lds_array(&mut self) -> (V, Role) {
+                if self.next(2) == 0 {
+                    (self.lds2, self.role2)
+                } else {
+                    (self.lds, self.role)
+                }
+            }
+
+            fn statement(&mut self) {
+                let c = self.cur;
+                let d = self.next(self.regs.len() as u64) as usize;
+                let r = match self.next(16) {
+                    0..=3 => {
+                        let op = [Bin::Add, Bin::Sub, Bin::Mul, Bin::And, Bin::Or, Bin::Xor]
+                            [self.next(6) as usize];
+                        let (x, y) = (self.value(), self.value());
+                        self.k.m.bin(c, op, x, y)
+                    }
+                    4 => {
+                        let g = self.cond();
+                        let x = self.value();
+                        self.k.m.select(self.cur, g, x, self.regs[d])
+                    }
+                    5 | 6 => {
+                        // private store
+                        let arr = if self.next(2) == 0 { self.pa } else { self.pb };
+                        let i = self.priv_index();
+                        let p = self.k.m.element(self.cur, arr, i);
+                        let v = self.value();
+                        self.k.m.store(self.cur, p, v);
+                        return;
+                    }
+                    7 | 8 => {
+                        let arr = if self.next(2) == 0 { self.pa } else { self.pb };
+                        let i = self.priv_index();
+                        let p = self.k.m.element(self.cur, arr, i);
+                        self.k.m.load(self.cur, p)
+                    }
+                    9..=11 => {
+                        // LDS, by the phase's role
+                        let (arr, role) = self.lds_array();
+                        match role {
+                            Role::Read => {
+                                let i = self.any_slot();
+                                let p = self.k.m.element(self.cur, arr, i);
+                                self.k.m.load(self.cur, p)
+                            }
+                            Role::Write | Role::Own => {
+                                let i = self.own_slot();
+                                let p = self.k.m.element(self.cur, arr, i);
+                                if role == Role::Write || self.next(2) == 0 {
+                                    let v = self.value();
+                                    self.k.m.store(self.cur, p, v);
+                                    return;
+                                }
+                                self.k.m.load(self.cur, p)
+                            }
+                        }
+                    }
+                    12 => {
+                        let (x, y) = (self.value(), self.value());
+                        self.k.m.call(c, self.k.reads, vec![x, y])
+                    }
+                    13 => {
+                        let (x, y) = (self.value(), self.value());
+                        self.k.m.call(c, self.k.writes, vec![x, y]);
+                        return;
+                    }
+                    14 => {
+                        let (x, y) = (self.value(), self.value());
+                        self.k.m.call(c, self.input, vec![x, y])
+                    }
+                    _ => {
+                        let (x, y) = (self.value(), self.value());
+                        self.k.m.call(c, self.k.pure, vec![x, y])
+                    }
+                };
+                self.regs[d] = r;
+            }
+
+            fn code(&mut self, depth: u32) {
+                for _ in 0..1 + self.next(6) {
+                    match self.next(8) {
+                        0 | 1 if depth > 0 => self.branch(depth - 1),
+                        2 | 3 if depth > 0 => self.repeat(depth - 1),
+                        _ => self.statement(),
+                    }
+                }
+            }
+
+            fn branch(&mut self, depth: u32) {
+                let c = self.cond();
+                let i32t = self.k.m.int(32);
+                let (then, other, join) = (
+                    self.k.m.new_block(),
+                    self.k.m.new_block(),
+                    self.k.m.new_block(),
+                );
+                self.k.m.terminate(self.cur, Term::CondBr(c, then, other));
+                let (before, known) = (self.regs.clone(), self.conds.len());
+                self.cur = then;
+                self.code(depth);
+                let (then_regs, then_end) = (std::mem::replace(&mut self.regs, before), self.cur);
+                self.k.m.terminate(then_end, Term::Br(join));
+                self.conds.truncate(known);
+                self.cur = other;
+                if self.next(3) != 0 {
+                    self.code(depth);
+                }
+                let other_end = self.cur;
+                self.k.m.terminate(other_end, Term::Br(join));
+                self.conds.truncate(known);
+                for (r, &t) in then_regs.iter().enumerate() {
+                    let p = self.k.m.phi(join, i32t);
+                    self.k
+                        .m
+                        .set_phi(p, vec![(t, then_end), (self.regs[r], other_end)]);
+                    self.regs[r] = p;
+                }
+                self.cur = join;
+            }
+
+            fn repeat(&mut self, depth: u32) {
+                let i32t = self.k.m.int(32);
+                let (head, exit) = (self.k.m.new_block(), self.k.m.new_block());
+                let before = self.cur;
+                self.k.m.terminate(before, Term::Br(head));
+                let entering = self.regs.clone();
+                let joins: Vec<V> = (0..self.regs.len())
+                    .map(|_| self.k.m.phi(head, i32t))
+                    .collect();
+                let count = self.k.m.phi(head, i32t);
+                self.regs = joins.clone();
+                let known = self.conds.len();
+                self.cur = head;
+                self.code(depth);
+                let one = self.k.m.i32(1);
+                let next = self.k.m.bin(self.cur, Bin::Add, count, one);
+                let limit = 1 + self.next(3) as u32;
+                let limit = self.k.m.i32(limit);
+                let mut more = self.k.m.cmp(self.cur, pred::IULT, next, limit);
+                if self.next(2) == 0 {
+                    let c = self.cond();
+                    more = self.k.m.bin(self.cur, Bin::And, more, c);
+                }
+                let latch = self.cur;
+                self.k.m.terminate(latch, Term::CondBr(more, head, exit));
+                for (r, &p) in joins.iter().enumerate() {
+                    self.k
+                        .m
+                        .set_phi(p, vec![(entering[r], before), (self.regs[r], latch)]);
+                }
+                let zero = self.k.m.i32(0);
+                self.k.m.set_phi(count, vec![(zero, before), (next, latch)]);
+                self.conds.truncate(known);
+                self.cur = exit;
+            }
+
+            fn barrier(&mut self) {
+                // Mostly group sync + TGSM fence (9); sometimes wider masks.
+                let mode = [9u32, 9, 9, 11, 15, 13, 9, 1 | 8][self.next(8) as usize];
+                let (op, m) = (self.k.m.i32(80), self.k.m.i32(mode));
+                self.k.m.call(self.cur, self.barrier, vec![op, m]);
+            }
+        }
+
+        fn program(seed: u64) -> Module {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let input =
+                k.m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadNone), false);
+            let tidf = k.m.function(
+                "dx.op.threadIdInGroup.i32",
+                fty,
+                Some(Attr::ReadNone),
+                false,
+            );
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier =
+                k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let parr = k.m.array(PRIV_LEN as u32, i32t);
+            let larr = k.m.array(LDS_LEN as u32, i32t);
+            let pa = k.m.global("pa", parr, 0);
+            let pb = k.m.global("pb", parr, 0);
+            let lds = k.m.global("lds", larr, 3);
+            let lds2 = k.m.global("lds2", larr, 3);
+            let b = k.b;
+            let z = k.m.i32(0);
+            let tid = k.m.call(b, tidf, vec![z, z]);
+            let mut g = G {
+                k,
+                rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                regs: Vec::new(),
+                conds: Vec::new(),
+                cur: b,
+                input,
+                tid,
+                barrier,
+                pa,
+                pb,
+                lds,
+                lds2,
+                role: Role::Write,
+                role2: Role::Write,
+            };
+            for r in 0..4 {
+                let (x, y) = (g.k.m.i32(r), g.k.m.i32(r * 3));
+                let v = g.k.m.call(b, input, vec![x, y]);
+                g.regs.push(v);
+            }
+            g.regs.push(tid);
+            // Every LDS slot starts written by its owner, then a barrier.
+            g.role = Role::Write;
+            for arr in [lds, lds2] {
+                for k4 in 0..(LDS_LEN / T as u64) as u32 {
+                    let kk = g.k.m.i32(k4 * T as u32);
+                    let i = g.k.m.bin(g.cur, Bin::Add, tid, kk);
+                    let p = g.k.m.element(g.cur, arr, i);
+                    let v = g.reg();
+                    g.k.m.store(g.cur, p, v);
+                }
+            }
+            g.barrier();
+            let phases = 2 + g.next(5);
+            for _ in 0..phases {
+                g.role = [Role::Read, Role::Read, Role::Write, Role::Own][g.next(4) as usize];
+                g.role2 = [Role::Read, Role::Read, Role::Write, Role::Own][g.next(4) as usize];
+                // Half the phases are straight-line, so barriers share a block.
+                let depth = if g.next(2) == 0 {
+                    0
+                } else {
+                    1 + g.next(2) as u32
+                };
+                g.code(depth);
+                g.barrier();
+                if g.next(5) == 0 {
+                    g.barrier(); // adjacent barriers
+                }
+            }
+            // A last read phase, outputs, return.
+            g.role = Role::Read;
+            g.role2 = Role::Read;
+            g.code(1);
+            for r in 0..g.regs.len() {
+                let at = g.k.m.i32(r as u32);
+                let v = g.regs[r];
+                g.k.m.call(g.cur, g.k.writes, vec![at, v]);
+            }
+            g.k.m.terminate(g.cur, Term::Ret);
+            g.k.m
+        }
+
+        struct Th {
+            b: usize,
+            from: usize,
+            pc: usize,
+            entered: bool,
+            vals: Vec<Option<u64>>,
+            privm: HashMap<u32, Vec<u64>>,
+            uav: [u64; 16],
+            trace: Vec<(String, Vec<u64>)>,
+            done: bool,
+            waiting: bool,
+            steps: usize,
+        }
+
+        enum Ev {
+            Ran,
+            Barrier,
+            Done,
+        }
+
+        fn eval(m: &Module, vals: &[Option<u64>], v: V) -> u64 {
+            match v {
+                V::Inst(i) => vals[i as usize].expect("a value defined before its use"),
+                V::Const(c) => match (&m.consts[c as usize].1, m.int_bits(m.consts[c as usize].0)) {
+                    (Const::Int(x), Some(bits)) => *x as u64 & mask(bits),
+                    (Const::Float(bits), _) => u64::from(*bits),
+                    _ => 0,
+                },
+                V::Global(g) => (u64::from(g) + 1) << 32,
+                V::Func(_) => panic!("a function as a value"),
+            }
+        }
+
+        fn decode(m: &Module, p: u64) -> (u32, u64, bool) {
+            let g = ((p >> 32) - 1) as u32;
+            let off = p & 0xFFFF_FFFF;
+            let space = m.globals[g as usize].space;
+            let len = if space == 3 { LDS_LEN } else { PRIV_LEN };
+            assert!(off < len, "out of bounds: global {g} offset {off}");
+            (g, off, space == 3)
+        }
+
+        fn step(
+            m: &Module,
+            th: &mut Th,
+            shared: &mut HashMap<u32, Vec<u64>>,
+            inputs: &[u32],
+            tid: usize,
+        ) -> Ev {
+            if th.done {
+                return Ev::Done;
+            }
+            th.steps += 1;
+            if th.steps > 50_000 {
+                th.trace.push(("still running".into(), Vec::new()));
+                th.done = true;
+                return Ev::Done;
+            }
+            let blk = &m.blocks[th.b];
+            if !th.entered {
+                let joined: Vec<(u32, u64)> = blk
+                    .phis
+                    .iter()
+                    .map(|&p| {
+                        let Op::Phi(incoming) = &m.insts[p as usize].op else {
+                            panic!("a join")
+                        };
+                        let v = incoming
+                            .iter()
+                            .find(|x| x.1 == th.from)
+                            .expect("a value for the edge taken");
+                        (p, eval(m, &th.vals, v.0))
+                    })
+                    .collect();
+                for (p, x) in joined {
+                    th.vals[p as usize] = Some(x);
+                }
+                th.entered = true;
+                th.pc = 0;
+                return Ev::Ran;
+            }
+            if th.pc < blk.body.len() {
+                let i = blk.body[th.pc];
+                th.pc += 1;
+                let inst = &m.insts[i as usize];
+                let bits = m.int_bits(inst.ty);
+                let mut ev = Ev::Ran;
+                let r: Option<u64> = match &inst.op {
+                    Op::Bin(op, x, y) => {
+                        let (x, y) = (eval(m, &th.vals, *x), eval(m, &th.vals, *y));
+                        let bits = bits.expect("integer arithmetic");
+                        let r = match op {
+                            Bin::Add => x.wrapping_add(y),
+                            Bin::Sub => x.wrapping_sub(y),
+                            Bin::Mul => x.wrapping_mul(y),
+                            Bin::And => x & y,
+                            Bin::Or => x | y,
+                            Bin::Xor => x ^ y,
+                            Bin::Shl => {
+                                if y < 64 {
+                                    x << y
+                                } else {
+                                    0
+                                }
+                            }
+                            Bin::LShr => {
+                                if y < 64 {
+                                    x >> y
+                                } else {
+                                    0
+                                }
+                            }
+                            Bin::AShr => (signed(bits, x) >> y.min(63)) as u64,
+                            _ => panic!("no divisions here"),
+                        };
+                        Some(r & mask(bits))
+                    }
+                    Op::Cmp(p, x, y) => {
+                        let wide = m.int_bits(m.type_of(*x)).expect("integer compare");
+                        let (x, y) = (eval(m, &th.vals, *x), eval(m, &th.vals, *y));
+                        let (sx, sy) = (signed(wide, x), signed(wide, y));
+                        Some(u64::from(match *p {
+                            pred::EQ => x == y,
+                            pred::NE => x != y,
+                            pred::IUGT => x > y,
+                            pred::IUGE => x >= y,
+                            pred::IULT => x < y,
+                            pred::IULE => x <= y,
+                            pred::SGT => sx > sy,
+                            pred::SGE => sx >= sy,
+                            pred::SLT => sx < sy,
+                            _ => sx <= sy,
+                        }))
+                    }
+                    Op::Select(c, t, f) => Some(if eval(m, &th.vals, *c) != 0 {
+                        eval(m, &th.vals, *t)
+                    } else {
+                        eval(m, &th.vals, *f)
+                    }),
+                    Op::Cast(op, x) => {
+                        let from_bits = m.int_bits(m.type_of(*x));
+                        let x = eval(m, &th.vals, *x);
+                        Some(match (op, from_bits, bits) {
+                            (Cast::Bitcast, _, _) | (Cast::ZExt, _, _) => x,
+                            (Cast::SExt, Some(f), Some(t)) => signed(f, x) as u64 & mask(t),
+                            (Cast::Trunc, _, Some(t)) => x & mask(t),
+                            _ => panic!("a cast the generator does not make"),
+                        })
+                    }
+                    Op::Gep(_, p, idx) => {
+                        let base = eval(m, &th.vals, *p);
+                        let mut off = base & 0xFFFF_FFFF;
+                        assert_eq!(idx.len(), 2, "two-index element address");
+                        let first = eval(m, &th.vals, idx[0]);
+                        assert_eq!(first, 0, "first index 0");
+                        off = off.wrapping_add(eval(m, &th.vals, idx[1]) & 0xFFFF_FFFF);
+                        Some((base & !0xFFFF_FFFF) | (off & 0xFFFF_FFFF))
+                    }
+                    Op::Load(p) => {
+                        let (g, off, lds) = decode(m, eval(m, &th.vals, *p));
+                        let v = if lds {
+                            shared.get(&g).map_or(0, |a| a[off as usize])
+                        } else {
+                            th.privm.get(&g).map_or(0, |a| a[off as usize])
+                        };
+                        Some(v)
+                    }
+                    Op::Store(p, v) => {
+                        let (g, off, lds) = decode(m, eval(m, &th.vals, *p));
+                        let v = eval(m, &th.vals, *v);
+                        let a = if lds {
+                            shared.entry(g).or_insert_with(|| vec![0; LDS_LEN as usize])
+                        } else {
+                            th.privm
+                                .entry(g)
+                                .or_insert_with(|| vec![0; PRIV_LEN as usize])
+                        };
+                        a[off as usize] = v;
+                        None
+                    }
+                    Op::Call(f, args) => {
+                        let a: Vec<u64> = args.iter().map(|&v| eval(m, &th.vals, v)).collect();
+                        let name = m.funcs[*f as usize].name.as_str();
+                        Some(match name {
+                            "dx.op.loadInput.i32" => u64::from(
+                                inputs[(a[0] ^ a[1]) as usize % inputs.len()]
+                                    ^ (tid as u32).wrapping_mul(0x9E37_79B9),
+                            ),
+                            "dx.op.threadIdInGroup.i32" => tid as u64,
+                            "dx.op.binary.i32" => a[0].min(a[1]),
+                            "dx.op.bufferLoad.i32" => th.uav[(a[0] ^ a[1]) as usize % 16],
+                            "dx.op.barrier" => {
+                                if a[1] & 1 != 0 {
+                                    ev = Ev::Barrier;
+                                }
+                                0
+                            }
+                            _ => {
+                                th.uav[a[0] as usize % 16] = a[1];
+                                th.trace.push((name.to_owned(), a));
+                                0
+                            }
+                        })
+                    }
+                    other => panic!("an instruction the harness does not run: {other:?}"),
+                };
+                if let Some(r) = r {
+                    th.vals[i as usize] = Some(r);
+                }
+                return ev;
+            }
+            th.from = th.b;
+            th.entered = false;
+            th.b = match blk.term.expect("a terminator") {
+                Term::Ret => {
+                    th.trace.push(("ret".into(), Vec::new()));
+                    th.done = true;
+                    return Ev::Done;
+                }
+                Term::Br(t) => t,
+                Term::CondBr(c, t, f) => {
+                    if eval(m, &th.vals, c) != 0 {
+                        t
+                    } else {
+                        f
+                    }
+                }
+            };
+            Ev::Ran
+        }
+
+        #[derive(Clone, Copy)]
+        enum Sched {
+            Seq([usize; T]),
+            RoundRobin,
+            Random(u64),
+        }
+
+        /// Three fixed orders, round robin, and two random interleavings.
+        const SCHEDULES: [Sched; 6] = [
+            Sched::Seq([0, 1, 2, 3]),
+            Sched::Seq([3, 2, 1, 0]),
+            Sched::Seq([1, 3, 0, 2]),
+            Sched::RoundRobin,
+            Sched::Random(0x1234_5678),
+            Sched::Random(0xDEAD_BEEF),
+        ];
+        /// Programs a plain `cargo test` runs.
+        const DEFAULT_SEEDS: u64 = 60;
+
+        type Outcome = (Vec<Vec<(String, Vec<u64>)>>, Vec<(u32, Vec<u64>)>);
+
+        fn run_group(m: &Module, inputs: &[u32], sched: Sched) -> Outcome {
+            let mut ths: Vec<Th> = (0..T)
+                .map(|_| Th {
+                    b: 0,
+                    from: usize::MAX,
+                    pc: 0,
+                    entered: false,
+                    vals: vec![None; m.insts.len()],
+                    privm: HashMap::new(),
+                    uav: [0; 16],
+                    trace: Vec::new(),
+                    done: false,
+                    waiting: false,
+                    steps: 0,
+                })
+                .collect();
+            let mut shared: HashMap<u32, Vec<u64>> = HashMap::new();
+            let mut rng = match sched {
+                Sched::Random(s) => s | 1,
+                _ => 1,
+            };
+            let mut rr = 0usize;
+            loop {
+                let runnable: Vec<usize> = (0..T)
+                    .filter(|&t| !ths[t].done && !ths[t].waiting)
+                    .collect();
+                if runnable.is_empty() {
+                    if ths.iter().all(|t| t.done) {
+                        break;
+                    }
+                    for t in ths.iter_mut() {
+                        t.waiting = false;
+                    }
+                    continue;
+                }
+                let t = match sched {
+                    Sched::Seq(order) => *order.iter().find(|&&t| runnable.contains(&t)).unwrap(),
+                    Sched::RoundRobin => {
+                        rr += 1;
+                        runnable[rr % runnable.len()]
+                    }
+                    Sched::Random(_) => {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        runnable[(rng >> 11) as usize % runnable.len()]
+                    }
+                };
+                match step(m, &mut ths[t], &mut shared, inputs, t) {
+                    Ev::Barrier => ths[t].waiting = true,
+                    Ev::Ran | Ev::Done => {}
+                }
+            }
+            let mut lds: Vec<(u32, Vec<u64>)> = shared.into_iter().collect();
+            lds.sort();
+            (ths.into_iter().map(|t| t.trace).collect(), lds)
+        }
+
+        fn barriers_in(m: &Module) -> usize {
+            m.blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .filter(|&&i| matches!(&m.insts[i as usize].op, Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.barrier"))
+                .count()
+        }
+        fn memory_ops_in(m: &Module) -> usize {
+            m.blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .filter(|&&i| matches!(&m.insts[i as usize].op, Op::Load(_) | Op::Store(_, _)))
+                .count()
+        }
+
+        /// The shape the read-after-read rule must leave alone: a barrier
+        /// between reads of other threads' slots and a store to the
+        /// thread's own slot, then more reads. Dropping it lets a thread
+        /// overwrite its slot before another thread has read it.
+        #[test]
+        fn a_barrier_between_reads_and_an_own_store_stays() {
+            for const_read in [true, false] {
+                let build = || {
+                    let mut k = kit();
+                    let (i32t, void) = (k.m.int(32), k.m.void());
+                    let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+                    let tidf = k.m.function(
+                        "dx.op.threadIdInGroup.i32",
+                        fty,
+                        Some(Attr::ReadNone),
+                        false,
+                    );
+                    let bty = k.m.func_ty(void, vec![i32t, i32t]);
+                    k.m.ptr(bty);
+                    let barrier =
+                        k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+                    let larr = k.m.array(LDS_LEN as u32, i32t);
+                    let lds = k.m.global("lds", larr, 3);
+                    let lds2 = k.m.global("lds2", larr, 3);
+                    let b = k.b;
+                    let (z, k80, k9, k1, k15, k100) = (
+                        k.m.i32(0),
+                        k.m.i32(80),
+                        k.m.i32(9),
+                        k.m.i32(1),
+                        k.m.i32(15),
+                        k.m.i32(100),
+                    );
+                    let tid = k.m.call(b, tidf, vec![z, z]);
+                    let own = k.m.element(b, lds, tid);
+                    k.m.store(b, own, tid);
+                    k.m.call(b, barrier, vec![k80, k9]);
+                    let next = k.m.bin(b, Bin::Add, tid, k1);
+                    let next = k.m.bin(b, Bin::And, next, k15);
+                    let other = if const_read {
+                        k.m.element(b, lds, k1)
+                    } else {
+                        k.m.element(b, lds, next)
+                    };
+                    let seen = k.m.load(b, other);
+                    k.m.call(b, barrier, vec![k80, k9]);
+                    let v = k.m.bin(b, Bin::Add, tid, k100);
+                    k.m.store(b, own, v);
+                    let k2 = k.m.i32(2);
+                    let far = k.m.element(b, lds2, k2);
+                    let back = k.m.load(b, far);
+                    k.m.call(b, barrier, vec![k80, k9]);
+                    k.m.call(b, k.writes, vec![seen, back]);
+                    k.m.terminate(b, Term::Ret);
+                    k.m
+                };
+                let plain = build();
+                let mut opt = build();
+                opt.optimise(ALL);
+                assert_eq!(
+                    barriers_in(&opt),
+                    barriers_in(&plain),
+                    "const_read {const_read}"
+                );
+                let inputs = [1u32, 2, 3, 4, 5, 6, 7];
+                let want = run_group(&plain, &inputs, SCHEDULES[0]);
+                for &s in &SCHEDULES {
+                    assert!(
+                        run_group(&opt, &inputs, s) == want,
+                        "const_read {const_read}"
+                    );
+                }
+                opt.write();
+            }
+        }
+
+        /// `VICTORY_OPT_GROUP_SEEDS` runs more programs than the default.
+        #[test]
+        fn passes_keep_what_a_thread_group_computes() {
+            let seeds: u64 = std::env::var("VICTORY_OPT_GROUP_SEEDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_SEEDS);
+            let scheds = SCHEDULES;
+            let masks = [
+                DEAD,
+                FOLD,
+                REUSE,
+                FACTS,
+                LOADS,
+                LICM,
+                BARRIERS,
+                LOADS | LICM,
+                LOADS | BARRIERS,
+                LOADS | LICM | BARRIERS,
+                ALL,
+            ];
+            let (mut racy, mut bar_removed, mut mem_removed) = (0u64, 0usize, 0usize);
+            for seed in 1..=seeds {
+                let plain = program(seed);
+                let inputs: Vec<Vec<u32>> = (0..3u32)
+                    .map(|n| {
+                        (0..7u32)
+                            .map(|i| {
+                                (seed as u32 ^ n)
+                                    .wrapping_mul(0x9E37_79B9)
+                                    .rotate_left(i * 5)
+                                    ^ (i << 28)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let mut expected = Vec::new();
+                let mut stable = true;
+                for inp in &inputs {
+                    let r0 = run_group(&plain, inp, scheds[0]);
+                    for &s in &scheds[1..] {
+                        if run_group(&plain, inp, s) != r0 {
+                            stable = false;
+                        }
+                    }
+                    expected.push(r0);
+                }
+                if !stable {
+                    racy += 1;
+                    continue;
+                }
+                let (b0, m0) = (barriers_in(&plain), memory_ops_in(&plain));
+                for &mask_ in &masks {
+                    let mut m = program(seed);
+                    m.optimise(mask_);
+                    for (inp, want) in inputs.iter().zip(&expected) {
+                        for &s in &scheds {
+                            let got = run_group(&m, inp, s);
+                            assert!(
+                                got == *want,
+                                "seed {seed} passes {mask_}: thread group result differs"
+                            );
+                        }
+                    }
+                    if mask_ == ALL {
+                        bar_removed += b0 - barriers_in(&m);
+                        mem_removed += m0.saturating_sub(memory_ops_in(&m));
+                    }
+                    m.write();
+                }
+            }
+            // The generator makes no racy program, so none is skipped.
+            assert_eq!(racy, 0, "programs whose result depends on the schedule");
+            // And the passes find work: barriers and memory operations go.
+            assert!(
+                bar_removed > 0 && mem_removed > 0,
+                "{bar_removed} barriers, {mem_removed} memory operations"
+            );
+        }
+    }
 }
