@@ -180,8 +180,8 @@ pub fn group_sync() -> u8 {
 ///   says about its condition, 16 one read for one place within a block and
 ///   non-aliasing local/shared forwarding, 32 a first-lane read of two host
 ///   waves without the round that asks which half has a lane (where every lane
-///   has one), 64 pure loop-invariant code motion, 128 adjacent redundant
-///   barrier elimination.
+///   has one), 64 pure loop-invariant code motion, 128 adjacent and
+///   read-after-read redundant barrier elimination.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
