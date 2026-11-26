@@ -405,11 +405,16 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 mod tests {
     use super::*;
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
+    /// The Windows test binary is a real MSVC-linked PE32+ image. Kept as a
+    /// Windows-only smoke test: on Linux the test binary is an ELF, so the
+    /// host file cannot stand in for one (issue: victory-pe tests fail on
+    /// Linux). The host-agnostic coverage lives in `fixture_image` below.
+    #[cfg(windows)]
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
+    #[cfg(windows)]
     #[test]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
@@ -429,9 +434,100 @@ mod tests {
         assert!(info.tls.is_some());
     }
 
+    /// A minimal PE32+ image, hand-built byte by byte: no host dependence,
+    /// so these tests run on any OS (the test binary itself is only a PE
+    /// when the suite is compiled for Windows — on Linux it is an ELF).
+    ///
+    /// Layout, all backed data in one ".text" section (rva 0x1000, 0x2000
+    /// bytes, file offset 0x200; rva - 0xE00 == file offset throughout):
+    ///   0x000 DOS header, `e_lfanew` = 0x40
+    ///   0x040 PE signature, COFF header (1 section, not a DLL),
+    ///   optional header PE32+, data directories at 0x0C8:
+    ///   Import (rva 0x2000), Exception (rva 0x2500), TLS (rva 0x2400)
+    ///   0x1400 (rva 0x2000) one kernel32 import descriptor + null
+    ///   0x1500 (rva 0x2100) INT: one by-name entry + null
+    ///   0x1580 (rva 0x2180) IAT: one slot + null
+    ///   0x1600 (rva 0x2200) "KERNEL32.DLL", 0x1680 hint + "ExitProcess"
+    ///   0x1800 (rva 0x2400) TLS directory (empty callback array)
+    ///   0x1900 (rva 0x2500) 12 bytes of .pdata
+    fn fixture_image() -> Vec<u8> {
+        let mut b = vec![0u8; 0x2200];
+        // DOS header
+        b[0..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes()); // e_lfanew
+        // COFF header
+        b[0x40..0x44].copy_from_slice(b"PE\0\0");
+        b[0x44..0x46].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
+        b[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // sections
+        b[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // optional header size
+        b[0x56..0x58].copy_from_slice(&0x0102u16.to_le_bytes()); // exe, not a DLL
+        let opt = 0x58;
+        b[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        b[opt + 16..opt + 20].copy_from_slice(&0x1010u32.to_le_bytes()); // entry point
+        b[opt + 24..opt + 32].copy_from_slice(&0x0001_4000_0000_u64.to_le_bytes()); // image base
+        b[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section alignment
+        b[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file alignment
+        b[opt + 56..opt + 60].copy_from_slice(&0x3000u32.to_le_bytes()); // size of image
+        b[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes()); // size of headers
+        b[opt + 68..opt + 70].copy_from_slice(&3u16.to_le_bytes()); // subsystem: windows-cui
+        b[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // rva and sizes
+        // Data directories at opt + 112: Import [1], Exception [3], TLS [9]
+        let dirs = opt + 112;
+        b[dirs + 8..dirs + 12].copy_from_slice(&0x2000u32.to_le_bytes());
+        b[dirs + 12..dirs + 16].copy_from_slice(&40u32.to_le_bytes());
+        b[dirs + 24..dirs + 28].copy_from_slice(&0x2500u32.to_le_bytes());
+        b[dirs + 28..dirs + 32].copy_from_slice(&12u32.to_le_bytes());
+        b[dirs + 72..dirs + 76].copy_from_slice(&0x2400u32.to_le_bytes());
+        b[dirs + 76..dirs + 80].copy_from_slice(&40u32.to_le_bytes());
+        // Section header ".text" at opt + 240
+        let sec = opt + 240;
+        b[sec..sec + 8].copy_from_slice(b".text\0\0\0");
+        b[sec + 8..sec + 12].copy_from_slice(&0x2000u32.to_le_bytes()); // virtual size
+        b[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // rva
+        b[sec + 16..sec + 20].copy_from_slice(&0x2000u32.to_le_bytes()); // raw size
+        b[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw pointer
+        b[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // code, can execute
+        // One kernel32 import descriptor at file 0x1200 (RVA 0x2000 = 0x1200 +
+        // delta 0xE00), followed by the zero terminator already in the vector.
+        b[0x1200..0x1204].copy_from_slice(&0x2100u32.to_le_bytes()); // OriginalFirstThunk
+        b[0x120C..0x1210].copy_from_slice(&0x2200u32.to_le_bytes()); // Name RVA
+        b[0x1210..0x1214].copy_from_slice(&0x2180u32.to_le_bytes()); // FirstThunk (IAT)
+        // INT entry (file 0x1300, RVA 0x2100): import by name, hint/name entry
+        // at RVA 0x2280 (file 0x1480)
+        b[0x1300..0x1308].copy_from_slice(&0x2280u64.to_le_bytes());
+        // IAT slot (file 0x1380, RVA 0x2180); the null terminator at 0x1388
+        // is already zero
+        b[0x1380..0x1388].copy_from_slice(&0x1010u64.to_le_bytes());
+        // "KERNEL32.DLL" at file 0x1400 (RVA 0x2200)
+        b[0x1400..0x140D].copy_from_slice(b"KERNEL32.DLL\0");
+        // hint (2 zero bytes at 0x1480) precedes the name at 0x1482
+        // (RVA 0x2282, matching the INT entry 0x2280 + hint field)
+        b[0x1482..0x148E].copy_from_slice(b"ExitProcess\0");
+        b
+    }
+
+    #[test]
+    fn parses_hand_built_pe() {
+        let info = ImageInfo::parse(&fixture_image()).unwrap();
+        assert_eq!(info.machine, MACHINE_AMD64);
+        assert!(!info.is_dll());
+        assert!(info.entry_rva != 0);
+        assert!(info.has_exception_table, "x64 images always carry .pdata");
+        assert!(info.sections.iter().any(|s| s.name.starts_with(".text")));
+        let kernel32 = info
+            .imports
+            .iter()
+            .find(|m| m.dll.eq_ignore_ascii_case("kernel32.dll"))
+            .expect("the fixture imports kernel32");
+        assert!(kernel32.entries.iter().all(|e| e.iat_slot_rva != 0));
+        // A TLS directory must be picked up (its callback array may
+        // legitimately be empty).
+        assert!(info.tls.is_some());
+    }
+
     #[test]
     fn rva_to_file_offset_maps_entry_point() {
-        let data = own_image();
+        let data = fixture_image();
         let info = ImageInfo::parse(&data).unwrap();
         let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
         assert!(off < data.len());
@@ -439,7 +535,7 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let mut info = ImageInfo::parse(&fixture_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
         assert!(info.rva_to_file_offset(rva).is_some());
         // Used to overflow (a panic in debug builds, a wrong offset in
@@ -452,14 +548,15 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
+        // Headers only: the section table and all backed data are gone.
+        let mut truncated = fixture_image();
         truncated.truncate(0x200);
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
     #[test]
     fn rejects_iat_outside_image() {
-        let mut data = own_image();
+        let mut data = fixture_image();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
         let import_rva = layout::read_u32(&data, dd).unwrap();
         let desc = ImageInfo::parse(&data)
