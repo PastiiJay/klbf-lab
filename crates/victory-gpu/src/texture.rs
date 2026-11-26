@@ -1612,7 +1612,7 @@ mod title_memory_tests {
         let pitch = first.Footprint.RowPitch as usize;
         let bytes = pitch * staging.rows[0] as usize;
         staging.layout.tile(data, 1, 0, &vec![0x55; bytes], pitch, bytes).unwrap();
-        staging.detile(data);
+        staging.detile(data, false);
         // SAFETY: the retained level has this mapped range in the staging buffer.
         let staged = unsafe { staging.data.add(first.Offset as usize) };
         assert_eq!(unsafe { *staged }, 0x55);
