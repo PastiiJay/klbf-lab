@@ -4797,7 +4797,22 @@ float4 lit() : SV_Target { return 1.0; }
         let gib = 1u64 << 30;
         let budget = 10 * gib; // ~12 GB GPU DXGI local budget
 
-        // Default room_percent = 82, trigger = 80.
+        // Default klbf-lab thresholds: room_percent = 90, trigger = 88.
+        assert_eq!(eviction_plan(budget, percent_of(budget, 87), 90, 88, 5_000), None);
+        let def_preempt = eviction_plan(budget, percent_of(budget, 88), 90, 88, 2_500)
+            .expect("must trigger preemptively at 88%");
+        assert!(!def_preempt.high_pressure);
+        assert_eq!(def_preempt.idle_frames, 60);
+        assert_eq!(def_preempt.idle_ms, 2_500);
+
+        let def_high = eviction_plan(budget, percent_of(budget, 90), 90, 88, 2_500)
+            .expect("must enter high pressure at 90%");
+        assert!(def_high.high_pressure);
+        assert_eq!(def_high.idle_frames, 30);
+        assert_eq!(def_high.idle_ms, 1_000);
+
+        // Explicit override VICTORY_TEXTURE_ROOM_PERCENT=82, trigger = 80:
+        // old 82..90% dead-zone is eliminated when a lower room ceiling is set.
         assert_eq!(eviction_plan(budget, percent_of(budget, 79), 82, 80, 5_000), None);
         let preempt = eviction_plan(budget, percent_of(budget, 80), 82, 80, 2_500)
             .expect("must trigger preemptively at 80%");
