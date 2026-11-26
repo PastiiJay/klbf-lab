@@ -93,9 +93,61 @@ struct ResolvedAddr {
     off: u64,
 }
 
+/// Reason a `!all` LDS region cannot be proven safe for native Wave32 execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refusal {
+    /// Divergent `s_barrier` inside a `!all` region.
+    DivergentBarrier,
+    /// Unhandled or non-addressable DS opcode inside a `!all` region.
+    UnknownDs,
+    /// Shared/unproven LDS atomic with no plain `ds_read*` in the `!all` region.
+    AtomicWithoutPlainRead,
+    /// Mixed plain LDS read (`ds_read*`) and write/atomic in one `!all` region.
+    ReadWriteOverlap,
+    /// Two plain LDS writes provably overlapping on a shared uniform base in one `!all` region.
+    WriteWriteOverlap,
+    /// Shared-base plain LDS write inside a cyclic `!all` region.
+    CyclicSharedWrite,
+}
+
+impl Refusal {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::DivergentBarrier => "a barrier in a lane-branch region",
+            Self::UnknownDs => "an unhandled LDS instruction in a lane-branch region",
+            Self::AtomicWithoutPlainRead => {
+                "an LDS atomic with no plain LDS read in one lane-branch region"
+            }
+            Self::ReadWriteOverlap => "an LDS read and write in one lane-branch region",
+            Self::WriteWriteOverlap => "overlapping LDS writes in one lane-branch region",
+            Self::CyclicSharedWrite => "a shared LDS write in a lane-branch loop",
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LDS_WRITE_ONLY_OK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Opt-in 32-lane host compatibility switch (`VICTORY_LDS_WRITE_ONLY_OK=1`) that restores the
+/// legacy write-only shortcut for `!all` regions with no plain `ds_read*` (including non-plain-read
+/// LDS atomics and shared-base write-only regions). Always disabled on non-32-lane hosts.
+fn lds_write_only_ok() -> bool {
+    if super::lower::host_max_wave() != 32 {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(enabled) = TEST_LDS_WRITE_ONLY_OK.get() {
+        return enabled;
+    }
+    std::env::var_os("VICTORY_LDS_WRITE_ONLY_OK").is_some_and(|v| v == "1")
+}
+
 /// Computes per-block `(meet_before, meet_before_exit)` barrier placements for LDS regions in a
 /// `WaveSize(64)` shader lowered to 32-lane waves, or `None` if any `!all` region may have an
 /// inter-half LDS hazard.
+#[cfg(test)]
 pub(super) fn meetings(
     p: &Program,
     st: &Structured,
@@ -104,6 +156,20 @@ pub(super) fn meetings(
     cs: ComputeIo,
     all: &[bool],
 ) -> Option<Vec<(bool, bool)>> {
+    analyze(p, st, io, res, cs, all).ok()
+}
+
+/// Computes per-block `(meet_before, meet_before_exit)` barrier placements for LDS regions in a
+/// `WaveSize(64)` shader lowered to 32-lane waves, or returns the specific [`Refusal`] reason
+/// explaining why a `!all` region kept Wave64.
+pub(super) fn analyze(
+    p: &Program,
+    st: &Structured,
+    io: &Io,
+    res: &Resources,
+    cs: ComputeIo,
+    all: &[bool],
+) -> Result<Vec<(bool, bool)>, Refusal> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -165,6 +231,7 @@ pub(super) fn meetings(
     let mut region_accesses: Vec<Vec<Access>> = vec![Vec::new(); n];
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let mut has_plain_read = vec![false; n];
     let mut has_rmw = vec![false; n];
     let mut has_unknown = vec![false; n];
     let mut has_barrier = vec![false; n];
@@ -190,7 +257,13 @@ pub(super) fn meetings(
                     reads[r] = true;
                 }
                 DsClass::One { kind, off, width } => {
-                    record_kind(&mut reads[r], &mut writes[r], &mut has_rmw[r], kind);
+                    record_kind(
+                        &mut reads[r],
+                        &mut writes[r],
+                        &mut has_plain_read[r],
+                        &mut has_rmw[r],
+                        kind,
+                    );
                     let expr = ctx.resolve_ds_addr(inst, b, off, width);
                     region_accesses[r].push(Access {
                         kind,
@@ -204,7 +277,13 @@ pub(super) fn meetings(
                     off1,
                     width,
                 } => {
-                    record_kind(&mut reads[r], &mut writes[r], &mut has_rmw[r], kind);
+                    record_kind(
+                        &mut reads[r],
+                        &mut writes[r],
+                        &mut has_plain_read[r],
+                        &mut has_rmw[r],
+                        kind,
+                    );
                     let e0 = ctx.resolve_ds_addr(inst, b, off0, width);
                     let e1 = ctx.resolve_ds_addr(inst, b, off1, width);
                     region_accesses[r].push(Access {
@@ -222,12 +301,16 @@ pub(super) fn meetings(
         }
     }
 
+    let write_only_ok = lds_write_only_ok();
     for r in 0..n {
         if region[r] != r {
             continue;
         }
-        if has_unknown[r] || has_barrier[r] {
-            return None;
+        if has_barrier[r] {
+            return Err(Refusal::DivergentBarrier);
+        }
+        if has_unknown[r] {
+            return Err(Refusal::UnknownDs);
         }
         if reads[r] && writes[r] {
             // Cyclic `!all` regions lack an in-loop barrier, so Refinement A cannot prevent
@@ -235,11 +318,18 @@ pub(super) fn meetings(
             let disjoint_ok = !region_has_cycle[r] && region_disjoint_ranges(&region_accesses[r]);
             let safe = disjoint_ok || region_lane_private(&region_accesses[r], cs.threads);
             if !safe {
-                return None;
+                if write_only_ok && !has_plain_read[r] {
+                    continue;
+                }
+                return Err(if has_plain_read[r] {
+                    Refusal::ReadWriteOverlap
+                } else {
+                    Refusal::AtomicWithoutPlainRead
+                });
             }
-        } else if writes[r] && !has_rmw[r] {
+        } else if writes[r] && !has_rmw[r] && !write_only_ok {
             if has_provable_shared_waw(&region_accesses[r]) {
-                return None;
+                return Err(Refusal::WriteWriteOverlap);
             }
             if region_has_cycle[r]
                 && region_accesses[r].iter().any(|a| {
@@ -248,7 +338,7 @@ pub(super) fn meetings(
                         .is_some_and(|e| e.tid == [0, 0, 0] && e.console_lane == 0)
                 })
             {
-                return None;
+                return Err(Refusal::CyclicSharedWrite);
             }
         }
     }
@@ -265,12 +355,21 @@ pub(super) fn meetings(
             }
         }
     }
-    Some(meet)
+    Ok(meet)
 }
 
-fn record_kind(reads: &mut bool, writes: &mut bool, has_rmw: &mut bool, kind: Kind) {
+fn record_kind(
+    reads: &mut bool,
+    writes: &mut bool,
+    has_plain_read: &mut bool,
+    has_rmw: &mut bool,
+    kind: Kind,
+) {
     match kind {
-        Kind::Read => *reads = true,
+        Kind::Read => {
+            *reads = true;
+            *has_plain_read = true;
+        }
         Kind::Write => *writes = true,
         Kind::Rmw => {
             *reads = true;
@@ -1911,6 +2010,14 @@ mod tests {
     }
 
     fn run_meetings(body: &[u32], threads: [u32; 3], lds_blocks: u32) -> Option<Vec<(bool, bool)>> {
+        run_analyze(body, threads, lds_blocks).ok()
+    }
+
+    fn run_analyze(
+        body: &[u32],
+        threads: [u32; 3],
+        lds_blocks: u32,
+    ) -> Result<Vec<(bool, bool)>, super::Refusal> {
         let native = make_cs(body, threads, lds_blocks, 16);
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
@@ -1920,7 +2027,33 @@ mod tests {
         let StageIo::Cs(cs) = native.io else {
             unreachable!();
         };
-        super::meetings(&p, &st, &io, &res, cs, &all)
+        super::analyze(&p, &st, &io, &res, cs, &all)
+    }
+
+    fn with_write_only_ok<T>(host_wave: u32, enabled: bool, f: impl FnOnce() -> T) -> T {
+        let prev_wave = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+        let prev_flag = super::TEST_LDS_WRITE_ONLY_OK.replace(Some(enabled));
+        let out = f();
+        super::TEST_LDS_WRITE_ONLY_OK.set(prev_flag);
+        lower::TEST_HOST_WAVE.set(prev_wave);
+        out
+    }
+
+    fn wave_why_reasons(body: &[u32], threads: [u32; 3], lds_blocks: u32) -> Vec<&'static str> {
+        let native = make_cs(body, threads, lds_blocks, 16);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let all = lower::all_lane_blocks(&st);
+        let StageIo::Cs(cs) = native.io else {
+            unreachable!();
+        };
+        let group = cs.threads.iter().product::<u32>();
+        let refusal = all
+            .as_ref()
+            .and_then(|a| super::analyze(&p, &st, &io, &res, cs, a).err());
+        lower::wave64_why_reasons(&p, &st, group, cs.lds_bytes() > 0, all.is_none(), refusal)
     }
 
     // Wrap a divergent branch around `inner_words` (`if (v0 < s0) { ... }`).
@@ -2675,5 +2808,193 @@ mod tests {
         pops_inner.extend(store_uav(4));
         pops_body.extend(if_v0_lt_s0(&pops_inner));
         assert!(run_meetings(&pops_body, [64, 1, 1], 1).is_none());
+    }
+
+    #[test]
+    fn write_only_ok_flag_handles_atomics_without_plain_read_and_four_kernels() {
+        // 1. Shared-address LDS atomic with NO plain ds_read* in the `!all` region:
+        //    default refuses (64); opt-in VICTORY_LDS_WRITE_ONLY_OK=1 on 32-lane host accepts (32);
+        //    non-32-lane host keeps refusing even with the opt-in flag set.
+        let mut shared_add = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        shared_add.extend(ds_add_u32(2, 3, 0));
+        shared_add.extend(store_uav(3));
+        let shared_add = if_v0_lt_s0(&shared_add);
+
+        let mut shared_rtn = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        shared_rtn.extend(ds_add_rtn_u32(4, 2, 3, 0));
+        shared_rtn.extend(store_uav(4));
+        let shared_rtn = if_v0_lt_s0(&shared_rtn);
+
+        for kernel in [&shared_add, &shared_rtn] {
+            with_write_only_ok(32, false, || {
+                assert_eq!(
+                    run_analyze(kernel, [64, 1, 1], 1),
+                    Err(super::Refusal::AtomicWithoutPlainRead)
+                );
+                assert_eq!(lowered_wave(kernel, [64, 1, 1], 1), 64);
+            });
+            with_write_only_ok(32, true, || {
+                assert!(run_analyze(kernel, [64, 1, 1], 1).is_ok());
+                assert_eq!(lowered_wave(kernel, [64, 1, 1], 1), 32);
+            });
+            with_write_only_ok(64, true, || {
+                assert_eq!(
+                    run_analyze(kernel, [64, 1, 1], 1),
+                    Err(super::Refusal::AtomicWithoutPlainRead)
+                );
+            });
+        }
+
+        // 2. Shared-address LDS atomic WITH an explicit plain ds_read_b32 in the same `!all`
+        //    region MUST stay refused (64) even with VICTORY_LDS_WRITE_ONLY_OK=1.
+        let mut atomic_plus_read = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        atomic_plus_read.extend(ds_add_u32(2, 3, 0));
+        atomic_plus_read.extend(ds_read_b32(4, 2, 0));
+        atomic_plus_read.extend(store_uav(4));
+        let atomic_plus_read = if_v0_lt_s0(&atomic_plus_read);
+        with_write_only_ok(32, false, || {
+            assert_eq!(
+                run_analyze(&atomic_plus_read, [64, 1, 1], 1),
+                Err(super::Refusal::ReadWriteOverlap)
+            );
+            assert_eq!(lowered_wave(&atomic_plus_read, [64, 1, 1], 1), 64);
+        });
+        with_write_only_ok(32, true, || {
+            assert_eq!(
+                run_analyze(&atomic_plus_read, [64, 1, 1], 1),
+                Err(super::Refusal::ReadWriteOverlap)
+            );
+            assert_eq!(lowered_wave(&atomic_plus_read, [64, 1, 1], 1), 64);
+        });
+
+        // 3. Four-kernel lowering matrix:
+        //    (a) same-dword write-only: 64 default -> 32 under opt-in flag on 32-lane host (64 on 64-lane)
+        let mut same_waw = vec![v_mov_k(2, 0), v_mov_k(3, 1), v_mov_k(4, 2)];
+        same_waw.extend(ds_write_b32(2, 3, 0));
+        same_waw.extend(ds_write_b32(2, 4, 0));
+        same_waw.extend(store_uav(3));
+        let same_waw = if_v0_lt_s0(&same_waw);
+        with_write_only_ok(32, false, || {
+            assert_eq!(
+                run_analyze(&same_waw, [64, 1, 1], 1),
+                Err(super::Refusal::WriteWriteOverlap)
+            );
+            assert_eq!(lowered_wave(&same_waw, [64, 1, 1], 1), 64);
+        });
+        with_write_only_ok(32, true, || {
+            assert!(run_analyze(&same_waw, [64, 1, 1], 1).is_ok());
+            assert_eq!(lowered_wave(&same_waw, [64, 1, 1], 1), 32);
+        });
+        with_write_only_ok(64, true, || {
+            assert_eq!(
+                run_analyze(&same_waw, [64, 1, 1], 1),
+                Err(super::Refusal::WriteWriteOverlap)
+            );
+        });
+
+        //    (b) separate writes: 32 in both modes
+        let mut sep_writes = vec![v_mov_k(2, 0), v_mov_k(3, 1), v_mov_k(4, 2)];
+        sep_writes.extend(ds_write_b32(2, 3, 0));
+        sep_writes.extend(ds_write_b32(2, 4, 4));
+        sep_writes.extend(store_uav(3));
+        let sep_writes = if_v0_lt_s0(&sep_writes);
+        for enabled in [false, true] {
+            with_write_only_ok(32, enabled, || {
+                assert!(run_analyze(&sep_writes, [64, 1, 1], 1).is_ok());
+                assert_eq!(lowered_wave(&sep_writes, [64, 1, 1], 1), 32);
+            });
+        }
+
+        //    (c) overlapping read + write: 64 in both modes
+        let mut overlap_rw = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        overlap_rw.extend(ds_write_b32(2, 3, 0));
+        overlap_rw.extend(ds_read_b32(4, 2, 0));
+        overlap_rw.extend(store_uav(4));
+        let overlap_rw = if_v0_lt_s0(&overlap_rw);
+        for enabled in [false, true] {
+            with_write_only_ok(32, enabled, || {
+                assert_eq!(
+                    run_analyze(&overlap_rw, [64, 1, 1], 1),
+                    Err(super::Refusal::ReadWriteOverlap)
+                );
+                assert_eq!(lowered_wave(&overlap_rw, [64, 1, 1], 1), 64);
+            });
+        }
+
+        //    (d) read disjoint from both writes: 32 in both modes
+        let mut disjoint_r_ww = vec![v_mov_k(2, 0), v_mov_k(3, 1), v_mov_k(4, 2)];
+        disjoint_r_ww.extend(ds_write_b32(2, 3, 0));
+        disjoint_r_ww.extend(ds_write_b32(2, 4, 4));
+        disjoint_r_ww.extend(ds_read_b32(5, 2, 8));
+        disjoint_r_ww.extend(store_uav(5));
+        let disjoint_r_ww = if_v0_lt_s0(&disjoint_r_ww);
+        for enabled in [false, true] {
+            with_write_only_ok(32, enabled, || {
+                assert!(run_analyze(&disjoint_r_ww, [64, 1, 1], 1).is_ok());
+                assert_eq!(lowered_wave(&disjoint_r_ww, [64, 1, 1], 1), 32);
+            });
+        }
+
+        // 4. Divergent s_barrier and unhandled ds_nop stay refused even under VICTORY_LDS_WRITE_ONLY_OK=1.
+        let mut bar_write = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        bar_write.extend(ds_write_b32(2, 3, 0));
+        bar_write.push(0xBF8A_0000); // s_barrier
+        bar_write.extend(store_uav(3));
+        let bar_write = if_v0_lt_s0(&bar_write);
+        with_write_only_ok(32, true, || {
+            assert_eq!(
+                run_analyze(&bar_write, [64, 1, 1], 1),
+                Err(super::Refusal::DivergentBarrier)
+            );
+        });
+
+        let mut nop_write = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        nop_write.extend(ds_enc(0x14, 0, 0, 0, 0, 0, 0)); // ds_nop
+        nop_write.extend(ds_write_b32(2, 3, 0));
+        nop_write.extend(store_uav(3));
+        let nop_write = if_v0_lt_s0(&nop_write);
+        with_write_only_ok(32, true, || {
+            assert_eq!(
+                run_analyze(&nop_write, [64, 1, 1], 1),
+                Err(super::Refusal::UnknownDs)
+            );
+        });
+    }
+
+    #[test]
+    fn wave64_why_distinguishes_write_write_atomic_and_mixed_read_write() {
+        // (a) Two plain writes to the same dword -> write/write overlap, NOT read+write.
+        let mut same_waw = vec![v_mov_k(2, 0), v_mov_k(3, 1), v_mov_k(4, 2)];
+        same_waw.extend(ds_write_b32(2, 3, 0));
+        same_waw.extend(ds_write_b32(2, 4, 0));
+        same_waw.extend(store_uav(3));
+        let waw_why = wave_why_reasons(&if_v0_lt_s0(&same_waw), [64, 1, 1], 1);
+        assert!(waw_why.contains(&"overlapping LDS writes in one lane-branch region"));
+        assert!(!waw_why.contains(&"an LDS read and write in one lane-branch region"));
+
+        // (b) Shared atomic with no plain ds_read* -> atomic-without-plain-read, NOT read+write.
+        let mut shared_atomic = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        shared_atomic.extend(ds_add_u32(2, 3, 0));
+        shared_atomic.extend(store_uav(3));
+        let atomic_why = wave_why_reasons(&if_v0_lt_s0(&shared_atomic), [64, 1, 1], 1);
+        assert!(atomic_why.contains(&"an LDS atomic with no plain LDS read in one lane-branch region"));
+        assert!(!atomic_why.contains(&"an LDS read and write in one lane-branch region"));
+
+        // (c) Mixed region with explicit plain ds_read* + atomic/write -> read and write.
+        let mut mixed_atomic = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        mixed_atomic.extend(ds_add_u32(2, 3, 0));
+        mixed_atomic.extend(ds_read_b32(4, 2, 0));
+        mixed_atomic.extend(store_uav(4));
+        let mixed_why = wave_why_reasons(&if_v0_lt_s0(&mixed_atomic), [64, 1, 1], 1);
+        assert!(mixed_why.contains(&"an LDS read and write in one lane-branch region"));
+
+        // (d) Divergent s_barrier inside `!all` -> barrier reason.
+        let mut bar_inner = vec![v_mov_k(2, 0), v_mov_k(3, 1)];
+        bar_inner.extend(ds_write_b32(2, 3, 0));
+        bar_inner.push(0xBF8A_0000); // s_barrier
+        bar_inner.extend(ds_read_b32(4, 2, 4));
+        bar_inner.extend(store_uav(4));
+        let bar_why = wave_why_reasons(&if_v0_lt_s0(&bar_inner), [64, 1, 1], 1);
+        assert!(bar_why.contains(&"a barrier in a lane-branch region"));
     }
 }
