@@ -164,6 +164,37 @@ class BenchLoopTests(unittest.TestCase):
             self.assertTrue(all(g["passed"] for g in entry["gates"].values()))
             self.assertAlmostEqual(entry["gates"]["gate6_composite_score"]["gain_pct"], 15.0, places=2)
 
+    def test_reject_when_a_repeat_ends_before_the_requested_frame_count(self) -> None:
+        spec = bench_loop.SceneSpec(name="drive", cmd=[], warmup=30, frames=120)
+
+        def report(ms: float, frames: int):
+            payload = {**make_payload(median_ms=ms), "world_frames": frames}
+            return bench_loop.parse_metrics_payload(payload, spec.name, 0, False)
+
+        baseline = [report(20.0, 120) for _ in range(3)]
+        candidate = [report(17.0, 120) for _ in range(3)]
+        for side in ("baseline", "candidate"):
+            with self.subTest(side=side):
+                base_runs = baseline.copy()
+                cand_runs = candidate.copy()
+                if side == "baseline":
+                    base_runs[1] = report(20.0, 1)
+                else:
+                    cand_runs[1] = report(17.0, 1)
+                accepted, gates = bench_loop.evaluate_gates(
+                    {spec.name: bench_loop.aggregate_runs(base_runs)},
+                    {spec.name: bench_loop.aggregate_runs(cand_runs)},
+                    [spec],
+                    bench_loop.GateConfig(),
+                    True,
+                    [],
+                    3,
+                )
+                self.assertFalse(accepted)
+                gate = gates["gate5_warmup_median"]
+                self.assertFalse(gate["passed"])
+                self.assertIn(side, " ".join(gate["errors"]))
+
     def test_reject_on_negative_crash_exit_code_mixed_with_zero(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             cand = make_payload(median_ms=15.0)

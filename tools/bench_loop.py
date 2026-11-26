@@ -486,7 +486,7 @@ def aggregate_runs(runs: list[RunMetrics]) -> RunMetrics:
         scene=first.scene,
         exit_code=next((r.exit_code for r in runs if r.exit_code != 0), 0),
         timed_out=any(r.timed_out for r in runs),
-        world_frames=int(statistics.median(r.world_frames for r in runs)),
+        world_frames=min(r.world_frames for r in runs),
         warmup_frames=min(r.warmup_frames for r in runs),
         median_frame_ms=float(statistics.median(r.median_frame_ms for r in runs)),
         avg_frame_ms=float(statistics.median(r.avg_frame_ms for r in runs)),
@@ -605,10 +605,14 @@ def evaluate_gates(
                 )
 
         # Gate 5: warmup exclusion + multi-run median
-        if spec.warmup > 0 and c.warmup_frames < spec.warmup:
-            warmup_errors.append(f"{spec.name}: warmup_frames={c.warmup_frames} < {spec.warmup}")
-        if c.world_frames <= 0 or c.median_frame_ms <= 0.0:
-            warmup_errors.append(f"{spec.name}: missing valid measured world_frames/median_frame_ms")
+        required_frames = max(1, spec.frames)
+        for side, run in (("baseline", b), ("candidate", c)):
+            if run.warmup_frames < spec.warmup:
+                warmup_errors.append(f"{spec.name} ({side}): warmup_frames={run.warmup_frames} < {spec.warmup}")
+            if run.world_frames < required_frames:
+                warmup_errors.append(f"{spec.name} ({side}): world_frames={run.world_frames} < {required_frames}")
+            if run.median_frame_ms <= 0.0:
+                warmup_errors.append(f"{spec.name} ({side}): missing valid median_frame_ms")
 
         # Gate 6: composite score & non-regression guardrails
         if b.median_frame_ms > 0:

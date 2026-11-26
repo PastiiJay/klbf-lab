@@ -2,6 +2,38 @@
 
 This guide documents the opt-in deterministic input replay, per-world-frame JSON metrics, and automated A/B + optimization loop harness. See [results.md](klbf/results.md) and [summarize_log.py](klbf/summarize_log.py) for existing manual log measurements.
 
+## Quick start: record one route and replay it twice
+
+Use paths **outside** the repository (e.g. `D:\bench\...`). Replay waits at neutral input while `world_frame() == 0` (menus/loading) and starts at the first frame with `>= 500` draws.
+
+**1. Record one route** (`30` warmup + `180` measured world frames, then clean exit):
+
+```powershell
+$env:VICTORY_INPUT_RECORD = 'D:\bench\route.jsonl'
+$env:VICTORY_BENCH_WARMUP = '30'
+$env:VICTORY_BENCH_EXIT_FRAMES = '180'
+.\target\release\victory.exe run --console series-s D:\Title\game.exe --execute
+Remove-Item Env:VICTORY_INPUT_RECORD
+```
+
+**2. Replay it twice** (baseline vs candidate, saving two JSON reports):
+
+```powershell
+$env:VICTORY_INPUT_REPLAY = 'D:\bench\route.jsonl'
+$env:VICTORY_BENCH_WARMUP = '30'
+$env:VICTORY_BENCH_EXIT_FRAMES = '180'
+
+# Run 1 (baseline)
+$env:VICTORY_BENCH_OUT = 'D:\bench\base.json'
+D:\builds\base\victory.exe run --console series-s D:\Title\game.exe --execute
+
+# Run 2 (candidate)
+$env:VICTORY_BENCH_OUT = 'D:\bench\cand.json'
+D:\builds\cand\victory.exe run --console series-s D:\Title\game.exe --execute
+```
+
+Or run interleaved A/B repeats automatically with `tools/bench_loop.py --mode ab` (see Section 3 below).
+
 ## 1. World-Frame Bench Telemetry (`victory-gpu::bench`)
 
 All benchmark reporting and exit hooks are disabled unless configured:
