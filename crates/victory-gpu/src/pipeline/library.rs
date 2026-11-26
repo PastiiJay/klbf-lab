@@ -420,6 +420,16 @@ pub(crate) fn trim() {
     }
 }
 
+const MICROSOFT_VENDOR_ID: u32 = 0x1414;
+const BASIC_RENDER_DRIVER_DEVICE_ID: u32 = 0x008c;
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp_suffix() -> String {
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("tmp.{pid}.{seq}")
+}
+
 /// Stable identity of the host D3D12 adapter, used to separate on-disk
 /// pipeline libraries across adapters (e.g. hardware GPU vs software WARP or
 /// another GPU) without encoding per-boot LUIDs or driver versions that would
@@ -433,6 +443,22 @@ struct AdapterKey {
 }
 
 impl AdapterKey {
+    /// Builds an [`AdapterKey`] from DXGI adapter descriptor fields.
+    /// Microsoft Basic Render Driver (`1414:008c`) can report `Flags == 0`
+    /// when enumerated as the default adapter, so recognize its PCI ID as
+    /// software alongside `DXGI_ADAPTER_FLAG_SOFTWARE`.
+    fn from_dxgi(vendor: u32, device: u32, revision: u32, flags: u32) -> Self {
+        use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE;
+        let software = (flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+            || (vendor == MICROSOFT_VENDOR_ID && device == BASIC_RENDER_DRIVER_DEVICE_ID);
+        Self {
+            vendor,
+            device,
+            revision,
+            software,
+        }
+    }
+
     fn slug(self) -> String {
         format!(
             "{:04x}-{:04x}-r{:02x}-{}",
@@ -448,8 +474,7 @@ impl AdapterKey {
 /// flag) behind `device`. Returns `None` if DXGI cannot enumerate the LUID.
 fn adapter_key(device: &ID3D12Device1) -> Option<AdapterKey> {
     use windows::Win32::Graphics::Dxgi::{
-        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
-        IDXGIFactory4,
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
     };
     // SAFETY: plain DXGI query for the device's own adapter LUID.
     unsafe {
@@ -457,12 +482,12 @@ fn adapter_key(device: &ID3D12Device1) -> Option<AdapterKey> {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
         let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
         let desc = adapter.GetDesc1().ok()?;
-        Some(AdapterKey {
-            vendor: desc.VendorId,
-            device: desc.DeviceId,
-            revision: desc.Revision,
-            software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
-        })
+        Some(AdapterKey::from_dxgi(
+            desc.VendorId,
+            desc.DeviceId,
+            desc.Revision,
+            desc.Flags,
+        ))
     }
 }
 
@@ -471,7 +496,7 @@ fn adapter_key(device: &ID3D12Device1) -> Option<AdapterKey> {
 struct LibraryFiles {
     bin: String,
     next: String,
-    tmp: String,
+    tmp_prefix: String,
     /// Whether an existing legacy unsuffixed `host-pipelines.bin` may be read
     /// (read-only) when this adapter has no keyed file yet. Disabled for
     /// software adapters so WARP never reads or maps a hardware cache.
@@ -483,7 +508,7 @@ impl LibraryFiles {
         Self {
             bin: LIBRARY_FILE.to_owned(),
             next: NEXT_FILE.to_owned(),
-            tmp: "host-pipelines.tmp".to_owned(),
+            tmp_prefix: "host-pipelines".to_owned(),
             legacy_fallback: false,
         }
     }
@@ -495,12 +520,19 @@ impl LibraryFiles {
                 Self {
                     bin: format!("host-pipelines-{slug}.bin"),
                     next: format!("host-pipelines-{slug}.next"),
-                    tmp: format!("host-pipelines-{slug}.tmp"),
+                    tmp_prefix: format!("host-pipelines-{slug}"),
                     legacy_fallback: !k.software,
                 }
             }
             None => Self::legacy(),
         }
+    }
+
+    /// Per-process, per-save unique temporary filename so concurrent processes
+    /// saving the same adapter key in one cache directory never clobber each
+    /// other's temporary file before the atomic rename.
+    fn temp_file(&self) -> String {
+        format!("{}.{}", self.tmp_prefix, unique_tmp_suffix())
     }
 }
 
@@ -757,12 +789,11 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(&library.files.tmp);
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let (bytes, write_early) = {
+    let (tmp, bytes, write_early) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -771,9 +802,10 @@ pub(crate) fn save(now: bool) {
         if !used_changed && added == 0 {
             return;
         }
-        let bytes = if added == 0 {
-            0
+        if added == 0 {
+            (None, 0, used_changed)
         } else {
+            let tmp = dir.join(library.files.temp_file());
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
@@ -787,12 +819,15 @@ pub(crate) fn save(now: bool) {
             }
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
-        };
-        (bytes, used_changed)
+            (Some(tmp), size, used_changed)
+        }
     };
-    let library_written = if bytes > 0 {
-        replace_library_files(dir, &tmp, &library.files)
+    let library_written = if let Some(tmp) = tmp.as_deref() {
+        let res = replace_library_files(dir, tmp, &library.files);
+        if res.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        res
     } else {
         Ok(false)
     };
@@ -895,9 +930,18 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    let mut tmp_name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    tmp_name.push(".");
+    tmp_name.push(unique_tmp_suffix());
+    let tmp = path.with_file_name(tmp_name);
+    if let Err(e) = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -1083,48 +1127,169 @@ mod tests {
 
     #[test]
     fn adapter_keys_produce_distinct_filenames_for_hardware_and_software() {
-        let nv = AdapterKey {
-            vendor: 0x10de,
-            device: 0x2783,
-            revision: 0xa1,
-            software: false,
-        };
-        let warp = AdapterKey {
-            vendor: 0x1414,
-            device: 0x008c,
-            revision: 0x00,
-            software: true,
-        };
+        use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE;
+        let sw_flag = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+        let nv = AdapterKey::from_dxgi(0x10de, 0x2783, 0xa1, 0);
+        let warp = AdapterKey::from_dxgi(0x1414, 0x008c, 0x00, sw_flag);
+        let default_brd = AdapterKey::from_dxgi(0x1414, 0x008c, 0x00, 0);
         let nv_files = LibraryFiles::for_adapter(Some(nv));
         let warp_files = LibraryFiles::for_adapter(Some(warp));
+        let brd_files = LibraryFiles::for_adapter(Some(default_brd));
         let fallback_files = LibraryFiles::for_adapter(None);
+
+        assert!(!nv.software);
+        assert!(warp.software);
+        assert!(default_brd.software);
+        assert_eq!(default_brd, warp);
+        assert_eq!(brd_files, warp_files);
 
         assert_eq!(nv_files.bin, "host-pipelines-10de-2783-ra1-hw.bin");
         assert_eq!(nv_files.next, "host-pipelines-10de-2783-ra1-hw.next");
-        assert_eq!(nv_files.tmp, "host-pipelines-10de-2783-ra1-hw.tmp");
         assert!(nv_files.legacy_fallback);
 
         assert_eq!(warp_files.bin, "host-pipelines-1414-008c-r00-sw.bin");
         assert_eq!(warp_files.next, "host-pipelines-1414-008c-r00-sw.next");
-        assert_eq!(warp_files.tmp, "host-pipelines-1414-008c-r00-sw.tmp");
         assert!(!warp_files.legacy_fallback);
 
         assert_ne!(nv_files.bin, warp_files.bin);
         assert_ne!(nv_files.next, warp_files.next);
-        assert_ne!(nv_files.tmp, warp_files.tmp);
+
+        let pid_prefix_nv = format!("host-pipelines-10de-2783-ra1-hw.tmp.{}.", std::process::id());
+        let pid_prefix_warp = format!("host-pipelines-1414-008c-r00-sw.tmp.{}.", std::process::id());
+        let nv_tmp1 = nv_files.temp_file();
+        let nv_tmp2 = nv_files.temp_file();
+        let warp_tmp = warp_files.temp_file();
+        assert!(nv_tmp1.starts_with(&pid_prefix_nv));
+        assert!(nv_tmp2.starts_with(&pid_prefix_nv));
+        assert_ne!(nv_tmp1, nv_tmp2);
+        assert!(warp_tmp.starts_with(&pid_prefix_warp));
+        assert_ne!(nv_tmp1, warp_tmp);
 
         assert_eq!(fallback_files.bin, LIBRARY_FILE);
         assert_eq!(fallback_files.next, NEXT_FILE);
         assert!(!fallback_files.legacy_fallback);
 
-        let spoofed_sw = AdapterKey {
-            software: true,
-            ..nv
-        };
+        let spoofed_sw = AdapterKey::from_dxgi(0x10de, 0x2783, 0xa1, sw_flag);
+        assert!(spoofed_sw.software);
         assert_ne!(
             LibraryFiles::for_adapter(Some(nv)).bin,
             LibraryFiles::for_adapter(Some(spoofed_sw)).bin
         );
+    }
+
+    #[test]
+    fn basic_render_driver_without_software_flag_isolates_from_legacy_and_shares_warp_cache() {
+        use windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE;
+        let dir = tempfile::tempdir().unwrap();
+        let default_brd = LibraryFiles::for_adapter(Some(AdapterKey::from_dxgi(
+            0x1414,
+            0x008c,
+            0x00,
+            0,
+        )));
+        let explicit_warp = LibraryFiles::for_adapter(Some(AdapterKey::from_dxgi(
+            0x1414,
+            0x008c,
+            0x00,
+            DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+        )));
+
+        assert_eq!(default_brd, explicit_warp);
+        assert_eq!(default_brd.bin, "host-pipelines-1414-008c-r00-sw.bin");
+        assert!(!default_brd.legacy_fallback);
+
+        let legacy_bytes = b"legacy-hardware-pso-blob".repeat(64);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &legacy_bytes).unwrap();
+
+        let (brd_blob, brd_legacy) = Blob::of_files(dir.path(), &default_brd);
+        assert!(matches!(brd_blob, Blob::None));
+        assert!(!brd_legacy);
+
+        let sw_tmp = dir.path().join(default_brd.temp_file());
+        let sw_saved = b"basic-render-driver-pso-blob".repeat(32);
+        std::fs::write(&sw_tmp, &sw_saved).unwrap();
+        assert!(replace_library_files(dir.path(), &sw_tmp, &default_brd).unwrap());
+
+        let (warp_blob, warp_legacy) = Blob::of_files(dir.path(), &explicit_warp);
+        assert!(!warp_legacy);
+        assert_eq!(warp_blob.bytes(), &sw_saved[..]);
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn temp_files_are_unique_across_calls_and_processes() {
+        const CHILD_ENV: &str = "VICTORY_TEST_LIB_TMP_CHILD";
+        let files = LibraryFiles::for_adapter(Some(AdapterKey::from_dxgi(0x10de, 0x2783, 0xa1, 0)));
+
+        if let Some(dir) = std::env::var_os(CHILD_ENV) {
+            let dir = PathBuf::from(dir);
+            let tmp_name = files.temp_file();
+            let tmp_path = dir.join(&tmp_name);
+            std::fs::write(&tmp_path, b"child-temp-payload").unwrap();
+            println!("CHILD_PID={} CHILD_TMP={}", std::process::id(), tmp_name);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent_pid = std::process::id();
+        let parent_tmp = files.temp_file();
+        let parent_path = dir.path().join(&parent_tmp);
+        std::fs::write(&parent_path, b"parent-temp-payload").unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::library::tests::temp_files_are_unique_across_calls_and_processes",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, dir.path())
+            .output()
+            .expect("spawn child process for temp filename check");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("CHILD_PID="))
+            .expect("child output line");
+        let mut parts = line.split_whitespace();
+        let child_pid: u32 = parts
+            .next()
+            .and_then(|s| s.strip_prefix("CHILD_PID="))
+            .and_then(|s| s.parse().ok())
+            .expect("child pid");
+        let child_tmp = parts
+            .next()
+            .and_then(|s| s.strip_prefix("CHILD_TMP="))
+            .expect("child tmp name");
+
+        assert_ne!(child_pid, parent_pid);
+        assert_ne!(child_tmp, parent_tmp);
+        assert!(child_tmp.starts_with(&format!("host-pipelines-10de-2783-ra1-hw.tmp.{child_pid}.")));
+        assert_eq!(std::fs::read(&parent_path).unwrap(), b"parent-temp-payload");
+        assert_eq!(std::fs::read(dir.path().join(child_tmp)).unwrap(), b"child-temp-payload");
+
+        let thread_tmps = std::sync::Mutex::new(HashSet::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let mut local = Vec::with_capacity(16);
+                    for _ in 0..16 {
+                        local.push(files.temp_file());
+                    }
+                    let mut guard = thread_tmps.lock().unwrap();
+                    for name in local {
+                        assert!(guard.insert(name));
+                    }
+                });
+            }
+        });
+        assert_eq!(thread_tmps.into_inner().unwrap().len(), 128);
     }
 
     #[test]
@@ -1150,7 +1315,7 @@ mod tests {
         assert!(matches!(sw_blob, Blob::None));
         assert!(!sw_legacy);
 
-        let sw_tmp = dir.path().join(&sw.tmp);
+        let sw_tmp = dir.path().join(sw.temp_file());
         let sw_saved = b"warp-pso-blob".repeat(64);
         std::fs::write(&sw_tmp, &sw_saved).unwrap();
         assert!(replace_library_files(dir.path(), &sw_tmp, &sw).unwrap());
@@ -1162,7 +1327,7 @@ mod tests {
         assert_eq!(hw_blob.bytes(), &legacy_bytes[..]);
         drop(hw_blob);
 
-        let hw_tmp = dir.path().join(&hw.tmp);
+        let hw_tmp = dir.path().join(hw.temp_file());
         let hw_saved = b"keyed-hardware-pso-blob".repeat(96);
         std::fs::write(&hw_tmp, &hw_saved).unwrap();
         assert!(replace_library_files(dir.path(), &hw_tmp, &hw).unwrap());
@@ -1239,7 +1404,7 @@ mod tests {
             unsafe { lib.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }
                 .expect("store compute PSO");
             let size = unsafe { lib.library.GetSerializedSize() };
-            let tmp = dir.join(&files.tmp);
+            let tmp = dir.join(files.temp_file());
             serialise(&lib.library, &tmp, size).expect("serialise library");
             replace_library_files(dir, &tmp, &files).expect("replace library file");
             files
