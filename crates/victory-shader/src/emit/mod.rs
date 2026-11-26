@@ -756,6 +756,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
@@ -782,6 +783,7 @@ mod tests {
         }
     }
     use super::container::SigElement;
+    #[cfg(windows)]
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -1359,6 +1361,8 @@ mod tests {
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
         }
+        #[cfg(not(windows))]
+        let _unused = out;
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
@@ -1515,6 +1519,8 @@ mod tests {
         })
         .unwrap();
         let mut dxil = l.dxil;
+        #[cfg(not(windows))]
+        let _unused = &mut dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
