@@ -119,7 +119,7 @@ With the view-tree `wineserver` in place, three switches of the `win10-test` lin
 | `VICTORY_RELAY_COPY_QUEUE=1` (fetches on a queue of their own) instead of `0` | 257 → 206 | the copy-back thread's wait for fetches 29 → 1 ms |
 | `VICTORY_COPY_COMPARE=1` | 206 → 207 | bytes put into card copies 170 → 32 MB a frame; the CPU now compares instead, so the frame did not move on this processor |
 
-The guide's `VICTORY_LATE_WAIT=0` for cards that stop responding still applies there; on this rig the relay ran without a device loss. Frame captures (`VICTORY_CAPTURE_WORLD`) cost about 235 ms each on the submitting thread: leave them off, or use `VICTORY_CAPTURE_WORLD_EVERY=64`, when you measure.
+The guide's `VICTORY_LATE_WAIT=0` for cards that stop responding still applies there; on this rig the relay ran without a device loss. Frame captures (`VICTORY_CAPTURE_WORLD`) cost about 235 ms each on the submitting thread. For a speed run, `unset VICTORY_CAPTURE_WORLD` before launch: the switch checks only whether the variable is set, so `0` still captures. If you need pictures while measuring, `VICTORY_CAPTURE_WORLD_EVERY=64` spaces them out.
 
 Please report results in an [issue](https://github.com/PastiiJay/klbf-lab/issues): GPU, driver, how long it ran, fps in the window title, and what looks wrong. For a scene-by-scene report, run `py -3 docs/klbf/summarize_log.py run.log --lines FIRST LAST` with the first and last line numbers for one scene. The [log summary tool](docs/klbf/summarize_log.py) reports median timing samples and separates real and presented FPS when frame generation is logged. Patch notes: [CHANGELOG.md](CHANGELOG.md). Full run log: [docs/klbf/results.md](docs/klbf/results.md).
 
