@@ -1,4 +1,4 @@
-"""Check that Windows shader pre-build initializes a fresh pipeline cache.
+"""Check Windows shader pre-build with empty and missing inputs on first use.
 
 From the repository root after building victory:
     py -3 tests/check_cold_cache.py target/release/victory.exe
@@ -28,13 +28,27 @@ def main():
         env.pop("VICTORY_CONFIG", None)
         env["VICTORY_CACHE_DIR"] = str(cache)
         env["VICTORY_DATA_DIR"] = str(root / "data")
+        command = [str(victory), "translate", "--cache", "--pipelines"]
         subprocess.run(
-            [str(victory), "translate", "--cache", "--pipelines", str(inputs)],
+            [*command, str(inputs)],
             cwd=root, env=env, check=True, timeout=60,
         )
         if not (cache / "pipelines").is_dir():
             raise SystemExit("FAIL: pre-build returned without creating cache/pipelines")
-    print("PASS: pre-build created cache/pipelines on a cold start")
+        print("PASS: pre-build created cache/pipelines on a cold start")
+
+        missing = root / "missing shaders.rpf"
+        unused_cache = root / "missing-input-cache"
+        env["VICTORY_CACHE_DIR"] = str(unused_cache)
+        result = subprocess.run(
+            [*command, str(inputs), str(missing)], cwd=root, env=env, timeout=60,
+            capture_output=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0 or str(missing) not in result.stderr:
+            raise SystemExit(f"FAIL: expected an error naming {missing}; got {result.stderr!r}")
+        if unused_cache.exists():
+            raise SystemExit("FAIL: pre-build created the cache before reporting a missing input")
+    print("PASS: pre-build named the missing input before creating its cache")
 
 
 if __name__ == "__main__":

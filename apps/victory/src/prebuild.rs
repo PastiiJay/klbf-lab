@@ -35,7 +35,7 @@ use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_game::pipelines::{self, Named, Unnamed};
 use victory_game::{sgd5, shaderpack};
 use victory_gpu::pipeline::{self, Prebuild};
@@ -63,6 +63,10 @@ const CRASHED_FILE: &str = "prebuild-crashed.txt";
 const SAVE_EVERY: usize = 200;
 
 pub fn run(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    for path in &paths {
+        std::fs::metadata(path)
+            .with_context(|| format!("checking shader pre-build input {}", path.display()))?;
+    }
     let paths = crate::default_paths(paths)?;
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let started = Instant::now();
