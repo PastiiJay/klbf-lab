@@ -1,18 +1,16 @@
-//! Instructions the console's CPU (Zen 2) has and a PC's may lack – a title raises
-//! STATUS_ILLEGAL_INSTRUCTION on them on an Intel CPU before Ice Lake / Alder Lake (CLWB,
-//! SHA) or on any Intel CPU (CLZERO, RDPRU, MONITORX / MWAITX and SSE4a's EXTRQ / INSERTQ,
-//! which are AMD's). The exception handler (`eh`) emulates the ones decoded here and steps over
-//! them.
+//! Decode x86-64 instructions handled by the illegal-instruction emulator.
 
-/// A console-only instruction at the faulting address.
+/// An instruction handled at the faulting address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleOnly {
     /// `clwb m8`: write a cache line back – nothing to do, the PC's memory is coherent
     Clwb,
     /// `clzero`: zero the 64-byte cache line at rAX
     Clzero,
-    /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero `[rax..reg)`
-    ClzeroLoop { end_reg: u8 },
+    /// A `clzero` loop with a 64-byte stride and a pointer bound or countdown.
+    ClzeroLoop(ZeroLoop),
+    /// An instruction changed into a same-length NOP by another thread.
+    PatchedInsn,
     /// `rdpru`: ecx = 0 MPERF / 1 APERF → edx:eax (a counter)
     Rdpru,
     /// `monitorx` / `mwaitx`: a wait the emulation skips
@@ -84,8 +82,118 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
     (b.len() >= len).then_some(len)
 }
 
-/// The console-only instruction at the start of `code` and its length.
-pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZeroLoop {
+    pub base: u8,
+    pub add: bool,
+    pub check: LoopCheck,
+    /// Offset of the back-edge target from the faulting instruction pointer.
+    pub target: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopCheck {
+    Pointer { end_reg: u8, reversed: bool },
+    Countdown { reg: u8, wide: bool },
+}
+
+// ADD base, 64 or LEA base, [base + 64]. LEA leaves the incoming flags intact.
+fn advance(code: &[u8]) -> Option<(u8, bool, usize)> {
+    let &[rex @ 0x48..=0x4f, op, m, ..] = code else { return None };
+    let base = (m & 7) | (rex & 1) << 3;
+    match op {
+        0x83 if m & 0xf8 == 0xc0 && code.get(3) == Some(&64) => Some((base, true, 4)),
+        0x8d if m >> 6 == 1 && ((m >> 3) & 7 | (rex & 4) << 1) == base => {
+            let disp = if m & 7 == 4 {
+                // An RSP/R12 base needs SIB, with no index.
+                if rex & 2 != 0 || code.get(3) != Some(&0x24) {
+                    return None;
+                }
+                4
+            } else {
+                3
+            };
+            (*code.get(disp)? == 64).then_some((base, false, disp + 1))
+        }
+        _ => None,
+    }
+}
+
+// DEC r32/r64; not INC, a memory operand, or a 16-bit counter.
+fn countdown(code: &[u8]) -> Option<(u8, bool, usize)> {
+    let (rex, b) = match code {
+        &[rex @ 0x40..=0x4f, ref b @ ..] => (rex, b),
+        _ => (0, code),
+    };
+    let &[0xff, m @ 0xc8..=0xcf, ..] = b else { return None };
+    Some(((m & 7) | (rex & 1) << 3, rex & 8 != 0, 2 + usize::from(rex != 0)))
+}
+
+// MOV rax, base: a non-RAX induction register must be copied back before the branch.
+fn copies_to_rax(code: &[u8], base: u8) -> bool {
+    code.starts_with(&[0x48 | ((base >> 3) << 2), 0x89, 0xc0 | ((base & 7) << 3)])
+        || code.starts_with(&[0x48 | (base >> 3), 0x8b, 0xc0 | (base & 7)])
+}
+
+fn zero_loop(code: &[u8], opcode: usize) -> Option<(ZeroLoop, usize)> {
+    let body = opcode + 3;
+    let backward = |at: usize, cc: u8| {
+        if *code.get(at)? != cc {
+            return None;
+        }
+        let len = at + 2;
+        let dest = len.checked_add_signed(*code.get(at + 1)? as i8 as isize)?;
+        // A back edge may target the original instruction or skip its ignored prefixes.
+        (dest == 0 || dest == opcode).then_some((dest, len))
+    };
+
+    let first_dec = countdown(&code[body..]);
+    let step = body + first_dec.map_or(0, |(_, _, len)| len);
+    let (base, add, step_len) = advance(&code[step..])?;
+    let mut at = step + step_len;
+    if let Some((reg, wide, n)) = first_dec.or_else(|| countdown(&code[at..])) {
+        // ADD after DEC would make JNE depend on the pointer instead of the counter.
+        if base != 0 || reg == 0 || (first_dec.is_some() && add) {
+            return None;
+        }
+        if first_dec.is_none() {
+            at += n;
+        }
+        let (target, len) = backward(at, 0x75)?;
+        return Some((ZeroLoop { base, add, check: LoopCheck::Countdown { reg, wide }, target }, len));
+    }
+
+    let copy_before = base != 0 && copies_to_rax(&code[at..], base);
+    if copy_before {
+        at += 3;
+    }
+    // CMP r64, r64: both encodings are allowed. For a reversed comparison
+    // the corresponding unsigned back edge is JA instead of JB.
+    let &[rex @ 0x48..=0x4f, op @ (0x39 | 0x3b), m @ 0xc0..=0xff] = code.get(at..at + 3)? else { return None };
+    let rm = (m & 7) | (rex & 1) << 3;
+    let reg = ((m >> 3) & 7) | (rex & 4) << 1;
+    let (lhs, rhs) = if op == 0x39 { (rm, reg) } else { (reg, rm) };
+    let is_pointer = |reg| reg == base || (copy_before && reg == 0);
+    let (end_reg, reversed) = if is_pointer(lhs) { (rhs, false) } else if is_pointer(rhs) { (lhs, true) } else { return None };
+    // Neither the induction register nor RAX can be a fixed bound.
+    if end_reg == base || end_reg == 0 {
+        return None;
+    }
+    at += 3;
+    if base != 0 && !copy_before {
+        if !copies_to_rax(&code[at..], base) {
+            return None;
+        }
+        at += 3;
+    }
+    let (target, len) = backward(at, if reversed { 0x77 } else { 0x72 })?;
+    Some((ZeroLoop { base, add, check: LoopCheck::Pointer { end_reg, reversed }, target }, len))
+}
+
+/// The handled instruction at the start of `code` and its length.
+pub fn decode(lookahead: &[u8]) -> Option<(ConsoleOnly, usize)> {
+    // Only the loop matcher can look past the maximum x86 instruction length.
+    let code = &lookahead[..lookahead.len().min(15)];
     let mut i = 0;
     // `rep`: the last of F2 / F3, which decides between them (and over 66) for SSE4a
     let (mut p66, mut pf3, mut rep, mut rex) = (false, false, 0u8, 0u8);
@@ -114,29 +222,22 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
     match (*code.get(i + 1)?, code.get(i + 2).copied()) {
         (0x01, Some(0xFC)) => {
-            // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
-            // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
-            // prefix – it is stepped alone, the loop is taken from the next one)
-            if code.len() >= i + 12
-                && !code[..i].contains(&0x67)
-                && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
-                && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
-                && code[i + 8] == 0x39
-                && (code[i + 9] & 0xC7) == 0xC0
-                && code[i + 10..i + 12] == [0x72, 0xF4]
+            // An address-size prefix takes the address from EAX, not RAX.
+            if !code[..i].contains(&0x67)
+                && let Some((loop_, len)) = zero_loop(lookahead, i)
             {
-                let rex_r = code[i + 7] == 0x4C;
-                let modrm = code[i + 9];
-                let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
-                if reg_idx != 0 {
-                    return Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12));
-                }
+                return Some((ConsoleOnly::ClzeroLoop(loop_), len));
             }
             Some((ConsoleOnly::Clzero, i + 3))
         }
         (0x01, Some(0xFD)) => Some((ConsoleOnly::Rdpru, i + 3)),
         (0x01, Some(0xFA)) => Some((ConsoleOnly::Monitorx, i + 3)),
         (0x01, Some(0xFB)) => Some((ConsoleOnly::Mwaitx, i + 3)),
+        // The second opcode byte is the only one changed by the patcher.
+        (0x1F, Some(0xFA | 0xFB)) => Some((ConsoleOnly::PatchedInsn, i + 3)),
+        (0x1F, Some(m)) if p66 && rep == 0 && (m >> 3) & 7 == 6 && m >> 6 != 3 => {
+            Some((ConsoleOnly::PatchedInsn, i + 2 + modrm_len(&code[i + 2..])?))
+        }
         (0x0B, _) => Some((ConsoleOnly::Ud2, i + 2)),
         // SSE4a: register operands only (ModRM mod 3); REX.R extends reg, REX.B rm
         // (the last of F2 / F3 decides: F2 INSERTQ, F3 #UD; neither with 66: EXTRQ)
@@ -153,8 +254,8 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 _ => None,
             }
         }
-        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt)
-        (0xAE, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
+        // 66 0F AE /6 with a memory operand (without 66 it is XSAVEOPT; F2/F3 are invalid).
+        (0xAE, Some(m)) if p66 && rep == 0 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
         // F3 0F C7 /7 with a register operand
         (0xC7, Some(m)) if pf3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
         _ => None,
@@ -183,16 +284,14 @@ mod tests {
     #[test]
     fn decodes_the_console_only_instructions() {
         assert_eq!(decode(&[0x0F, 0x01, 0xFC]), Some((ConsoleOnly::Clzero, 3)));
-        // clzero loop against r10 (4C 39 D0 = cmp rax, r10)
-        assert_eq!(
-            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xD0, 0x72, 0xF4]),
-            Some((ConsoleOnly::ClzeroLoop { end_reg: 10 }, 12))
-        );
-        // clzero loop against rdx (48 39 D0 = cmp rax, rdx)
-        assert_eq!(
-            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]),
-            Some((ConsoleOnly::ClzeroLoop { end_reg: 2 }, 12))
-        );
+        // `cmp rax, r10` / `cmp rax, rdx` differ only in REX.R.
+        for (rex, end_reg) in [(0x4c, 10), (0x48, 2)] {
+            let check = LoopCheck::Pointer { end_reg, reversed: false };
+            assert_eq!(
+                decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, rex, 0x39, 0xD0, 0x72, 0xF4]),
+                Some((ConsoleOnly::ClzeroLoop(ZeroLoop { base: 0, add: true, check, target: 0 }), 12))
+            );
+        }
         // the same loop after an address-size prefix: that one CLZERO alone
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 4)));
         // cmp rcx, rdx (48 39 D1), cmp [rax], rdx (48 39 10), cmp rax, rax (48 39 C0): NOT a clzero loop
@@ -236,6 +335,14 @@ mod tests {
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC]), Some((ConsoleOnly::Clzero, 4)));
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x38]), None);
         assert_eq!(decode(&[0x0F, 0xAE, 0x30]), None);
+        assert_eq!(decode(&[0x67, 0x0F, 0x1F, 0xFB]), Some((ConsoleOnly::PatchedInsn, 4)));
+        assert_eq!(decode(&[0x66, 0x41, 0x0F, 0x1F, 0x74, 0x24, 0x08]), Some((ConsoleOnly::PatchedInsn, 7)));
+        for op in [0xAE, 0x1F] {
+            for rep in [0xF2, 0xF3] {
+                assert_eq!(decode(&[0x66, rep, 0x0F, op, 0x30]), None);
+                assert_eq!(decode(&[rep, 0x66, 0x0F, op, 0x30]), None);
+            }
+        }
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24]), None);
         assert_eq!(decode(&[0x0F]), None);

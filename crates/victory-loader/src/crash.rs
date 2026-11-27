@@ -134,10 +134,7 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
-/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
-/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// Legacy fallback for wait, write-back and SSE4a instructions.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -149,7 +146,8 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         }
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+            // The primary emulator already checked whether the cache line is writable.
+            [0x0f, 0x01, 0xfc] => return false,
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
@@ -278,7 +276,7 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 }
 
 /// The general register numbered `n` as instructions encode it.
-fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
+pub(crate) fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
     match n & 15 {
         0 => &mut context.Rax,
         1 => &mut context.Rcx,
@@ -300,7 +298,7 @@ fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
 }
 
 /// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-fn cmp_flags(a: u64, b: u64) -> u32 {
+pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
     let r = a.wrapping_sub(b);
     u32::from(a < b)
         | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
@@ -309,7 +307,7 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
         | ((r >> 63) as u32) << 7
         | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
 }
-const CMP_FLAGS: u32 = 0x8d5;
+pub(crate) const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
@@ -356,18 +354,17 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
-unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    // an instruction of the console's CPU this one lacks: emulated, the title goes on
-    // SAFETY: the system passes valid exception pointers.
-    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
-        // SAFETY: the faulting thread's context, for the exception being dispatched.
-        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
-        if r != 0 {
-            return r;
-        }
+unsafe fn emulate_instruction(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: the caller passes valid exception pointers for the faulting thread.
+    unsafe {
+        (*(*info).ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION
+            && (crate::console_insn::emulate(&mut *(*info).ContextRecord) != 0 || emulate_amd_only(info))
     }
+}
+
+unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
-    if unsafe { emulate_amd_only(info) } {
+    if unsafe { emulate_instruction(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
@@ -807,11 +804,15 @@ mod tests {
                 out("xmm0") _, out("xmm1") _)
         };
         assert_eq!(out, 0xbc); // 0x1111_2222_abcd_4444 >> 20, 8 bits
-        // SAFETY: monitorx/mwaitx are wait hints that write no memory.
-        unsafe {
-            std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
-                in("rax") at, in("ecx") 0, in("edx") 0)
-        };
+        let max_ext = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+        let has_monitorx = max_ext >= 0x8000_0001 && std::arch::x86_64::__cpuid(0x8000_0001).ecx & (1 << 29) != 0;
+        if !has_monitorx {
+            // SAFETY: on this CPU the opcodes reach the illegal-instruction handler.
+            unsafe {
+                std::arch::asm!(".byte 0x0f, 0x01, 0xfa", ".byte 0x0f, 0x01, 0xfb",
+                    in("rax") at, in("ecx") 0, in("edx") 0)
+            };
+        }
     }
 
     fn reg(low: u64, high: u64) -> M128A {
@@ -846,7 +847,7 @@ mod tests {
                 ExceptionRecord: &mut record,
                 ContextRecord: &mut context,
             };
-            let emulated = emulate_amd_only(&mut pointers);
+            let emulated = emulate_instruction(&mut pointers);
             *xmm = context.Anonymous.FltSave.XmmRegisters;
             emulated.then(|| context.Rip - start)
         }
