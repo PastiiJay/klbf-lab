@@ -31,6 +31,9 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security"] }
+
 [features]
 # Debugging switches (scheduled stack dumps and the like).
 diagnostics = []
