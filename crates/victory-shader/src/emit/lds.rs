@@ -766,14 +766,13 @@ fn region_lane_private(accesses: &[Access], threads: [u32; 3]) -> bool {
             if a.uniforms != b.uniforms {
                 return false;
             }
+            // Compare the already-computed half-open footprint intervals `[min_lo, max_hi)`
+            // directly: `ranges_may_overlap` expects single-instruction widths and truncates
+            // non-4-multiple aggregate widths (e.g. `n = 33`) down to a multiple of 4 on the
+            // aligned path.
             let align4 = a.uniform_tz >= 2 && b.uniform_tz >= 2;
-            if ranges_may_overlap(
-                a.min_lo,
-                a.max_hi - a.min_lo,
-                b.min_lo,
-                b.max_hi - b.min_lo,
-                align4,
-            ) || (a.max_width >= 4 || b.max_width >= 4) && !align4
+            if (a.min_lo < b.max_hi && b.min_lo < a.max_hi)
+                || ((a.max_width >= 4 || b.max_width >= 4) && !align4)
             {
                 return false;
             }
@@ -2996,5 +2995,121 @@ mod tests {
         bar_inner.extend(store_uav(4));
         let bar_why = wave_why_reasons(&if_v0_lt_s0(&bar_inner), [64, 1, 1], 1);
         assert!(bar_why.contains(&"a barrier in a lane-branch region"));
+    }
+
+    #[test]
+    fn partial_workgroup_byte_alias_is_refused() {
+        let make_byte_access = |kind: super::Kind, tid_x: u64, off: u64| super::Access {
+            kind,
+            width: 1,
+            expr: Some(super::ResolvedAddr {
+                uniforms: Vec::new(),
+                uniform_tz: 32,
+                tid: [tid_x, 0, 0],
+                console_lane: 0,
+                off,
+            }),
+        };
+
+        // Partial workgroups (`n = 33`, `n = 63`) and full multiples (`32`, `64`):
+        // write at `tid.x` (`[0, n)`) aliases uniform read at `off = n - 1` (written by thread `n - 1`).
+        for n in [32u32, 33, 63, 64] {
+            let write = make_byte_access(super::Kind::Write, 1, 0);
+            let alias_read = make_byte_access(super::Kind::Read, 0, u64::from(n - 1));
+            assert!(
+                !super::region_lane_private(&[write.clone(), alias_read.clone()], [n, 1, 1]),
+                "n={n}: byte write [0, {n}) aliases uniform byte read at {}",
+                n - 1
+            );
+            assert!(
+                !super::region_lane_private(&[alias_read, write.clone()], [n, 1, 1]),
+                "n={n}: reversed order must also reject byte alias at {}",
+                n - 1
+            );
+
+            // Disjoint uniform byte read at `off = n` (immediately past `[0, n)`) stays accepted.
+            let disjoint_read = make_byte_access(super::Kind::Read, 0, u64::from(n));
+            assert!(
+                super::region_lane_private(&[write, disjoint_read], [n, 1, 1]),
+                "n={n}: uniform byte read at {n} is disjoint from [0, {n})"
+            );
+        }
+
+        // End-to-end shader lowering check for `n = 33` and `n = 63`:
+        // `ds_write_b8(v0, v3, 0)` + `ds_read_u8(v4, 0, n - 1)` inside `!all` must stay Wave64,
+        // while `off = n` recovers Wave32.
+        for n in [33u32, 63] {
+            let mut alias_inner = vec![v_mov_k(2, 0), v_mov_k(3, 7)];
+            alias_inner.extend(ds_write_b8(0, 3, 0));
+            alias_inner.extend(ds_read_u8(4, 2, (n - 1) as u16));
+            alias_inner.extend(store_uav(4));
+            let alias_body = if_v0_lt_s0(&alias_inner);
+            assert_eq!(
+                run_analyze(&alias_body, [n, 1, 1], 1),
+                Err(super::Refusal::ReadWriteOverlap),
+                "n={n}: end-to-end analysis must refuse cross-lane byte alias"
+            );
+            assert_eq!(lowered_wave(&alias_body, [n, 1, 1], 1), 64);
+
+            let mut disjoint_inner = vec![v_mov_k(2, 0), v_mov_k(3, 7)];
+            disjoint_inner.extend(ds_write_b8(0, 3, 0));
+            disjoint_inner.extend(ds_read_u8(4, 2, n as u16));
+            disjoint_inner.extend(store_uav(4));
+            let disjoint_body = if_v0_lt_s0(&disjoint_inner);
+            assert!(
+                run_analyze(&disjoint_body, [n, 1, 1], 1).is_ok(),
+                "n={n}: disjoint byte read at {n} should be accepted"
+            );
+            assert_eq!(lowered_wave(&disjoint_body, [n, 1, 1], 1), 32);
+        }
+    }
+
+    #[test]
+    fn exhaustive_byte_access_oracle_has_zero_false_accepts() {
+        let mut total = 0usize;
+        let mut false_accepts = 0usize;
+        let mut sharing_cases = 0usize;
+        for n in 32u64..=65 {
+            for stride in [1u64, 2, 4] {
+                for initial in 0u64..4 {
+                    for r in 0u64..=(n * stride + 4) {
+                        total += 1;
+                        let write = super::Access {
+                            kind: super::Kind::Write,
+                            width: 1,
+                            expr: Some(super::ResolvedAddr {
+                                uniforms: Vec::new(),
+                                uniform_tz: 32,
+                                tid: [stride, 0, 0],
+                                console_lane: 0,
+                                off: initial,
+                            }),
+                        };
+                        let read = super::Access {
+                            kind: super::Kind::Read,
+                            width: 1,
+                            expr: Some(super::ResolvedAddr {
+                                uniforms: Vec::new(),
+                                uniform_tz: 32,
+                                tid: [0, 0, 0],
+                                console_lane: 0,
+                                off: r,
+                            }),
+                        };
+                        let shares = (0..n).any(|tid| initial + stride * tid == r);
+                        if shares {
+                            sharing_cases += 1;
+                        }
+                        let accepted = super::region_lane_private(&[write, read], [n as u32, 1, 1]);
+                        if shares && accepted {
+                            false_accepts += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(total, 48_212);
+        assert!(sharing_cases > 0);
+        assert_eq!(false_accepts, 0);
     }
 }
