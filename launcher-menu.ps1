@@ -1170,7 +1170,7 @@ function New-KlbfMenuForm($Choice, $Hardware, [string]$ShaderStatus = '', $Info 
     $g = & $group $page 'Output resolution, display, mode' 426 90
     $c.output = & $combo $g 12 22 112
     foreach ($m in $script:KlbfModes) { [void]$c.output.Items.Add($m) }
-    $c.screens = if ($null -ne $Info.screens) { @($Info.screens) } else { @(Get-KlbfScreens) }
+    $c.screens = @(if ($null -ne $Info.screens) { @($Info.screens) } else { @(Get-KlbfScreens) })
     $c.display = & $combo $g 130 22 192
     # (27/11) Window or borderless fullscreen on the chosen display (Alt+Enter switches in the game)
     $c.mode = & $combo $g 328 22 146
