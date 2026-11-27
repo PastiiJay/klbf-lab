@@ -311,6 +311,14 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     true
 }
 
+/// Whether `page` was noted written in the write-watch journal strictly after
+/// asking `since` (used by lazy copy-back to reject concurrently CPU-written
+/// pages without mutating journal state).
+pub(crate) fn was_written_since(page: usize, since: u64) -> bool {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.written.get(&page).is_some_and(|&w| w > since)
+}
+
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
 /// pages written since tracking began and the asking that last found each
@@ -533,6 +541,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
+        if block < last && crate::shadow::is_lazy_deferred_page(block) {
+            // Never overwrite a lazy GPU-resident `PAGE_NOACCESS` protection
+            // with `PAGE_READONLY`.
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block);
+            }
+            continue;
+        }
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
@@ -671,7 +687,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(&block) || crate::shadow::is_lazy_deferred_page(block) {
         return;
     }
     let mut old = 0;
@@ -771,11 +787,90 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// Atomically transitions a single-view clean `watch`-guarded block directly
+/// from `PAGE_READONLY` to `PAGE_NOACCESS` for lazy GPU-resident write-back,
+/// removing it from `GUARDS` so no CPU write can slip in between. Returns
+/// `true` only if the block was clean, non-aliased, and protected as
+/// `PAGE_READONLY`.
+pub(crate) fn transition_clean_guard_to_noaccess(block: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READONLY, VirtualProtect};
+    let mut g = guards();
+    if !g.protected.contains(&block) || !g.clean.contains(&block) || g.aliased.contains(&block) {
+        return false;
+    }
+    let mut old = 0;
+    // SAFETY: a single-view committed block that `watch` itself set to `PAGE_READONLY`.
+    let ok = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) } != 0;
+    if !ok {
+        return false;
+    }
+    if old != PAGE_READONLY {
+        let mut _revert = 0;
+        // SAFETY: restoring the unexpected prior protection.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut _revert) };
+        return false;
+    }
+    g.protected.remove(&block);
+    g.clean.remove(&block);
+    true
+}
+
+/// Whether `block` is currently protected read-only by `watch` guards.
+pub(crate) fn is_guarded(block: usize) -> bool {
+    guards().protected.contains(&block)
+}
+
+/// Before a caller invokes `VirtualFree` on title memory `[at, at + len)`:
+/// waits for any in-flight lazy flush, drops deferred `PAGE_NOACCESS`
+/// protections (restoring `PAGE_READWRITE` while committed), and removes
+/// `watch` guard metadata so the pages are released cleanly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn before_virtual_free(at: usize, len: usize) {
+    crate::shadow::lazy_release_range(at, len);
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
+        for p in stale {
+            j.written.remove(&p);
+        }
+    }
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+    for block in absent {
+        g.absent.remove(&block);
+    }
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
+    for block in blocks {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+    }
+    let aliased: Vec<usize> = g.aliased.range(range).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+    }
+}
+
+/// Before a caller invokes `VirtualProtect` on title memory `[at, at + len)`:
+/// flushes any deferred GPU-resident pieces into title memory and restores
+/// `PAGE_READWRITE`, and opens `watch` guards so the caller sees coherent
+/// contents and prior protections.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn before_virtual_protect(at: usize, len: usize) {
+    crate::shadow::lazy_flush_range(at, len);
+    open(&mut guards(), at, at.saturating_add(len));
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // Flush any lazy GPU-resident `PAGE_NOACCESS` pages before kernel writes
+    // (which do not enter VEH) and before taking `GUARDS`.
+    crate::shadow::lazy_flush_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -833,6 +928,10 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // Release any lazy GPU-resident `PAGE_NOACCESS` pages WITHOUT overwriting
+    // the freshly written DirectStorage / kernel bytes with stale GPU bytes
+    // (restoring GPU bytes only in any unwritten partial-page complement).
+    crate::shadow::lazy_release_written_range(at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {
@@ -870,6 +969,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     let ranges = crate::inplace::views_of_section(section, offset, len);
     if ranges.is_empty() {
         return;
+    }
+    for &(at, n) in &ranges {
+        crate::shadow::lazy_flush_range(at, n);
     }
     let mut g = guards();
     for &(at, n) in &ranges {
@@ -999,6 +1101,10 @@ pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync
 /// ([`title_memory_remapping`]).
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
+    /// Scoped active-remap barrier in `shadow::LAZY_TABLE` preventing concurrent
+    /// relay/submit threads from re-arming `PAGE_NOACCESS` on `[at, at + len)`
+    /// while views are being unmapped or replaced; dropped after `_held`.
+    _lazy: crate::shadow::LazyRemapGuard,
     since: std::time::Instant,
 }
 
@@ -1015,6 +1121,7 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
+    let lazy = crate::shadow::lazy_begin_remapping(at, len);
     let started = std::time::Instant::now();
     let held = if by_range() {
         let end = at.saturating_add(len);
@@ -1038,6 +1145,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
         _held: held,
+        _lazy: lazy,
         since: std::time::Instant::now(),
     }
 }
@@ -1050,6 +1158,7 @@ pub struct Reading(#[allow(dead_code)] Held<std::sync::RwLockReadGuard<'static, 
 /// memory found mapped stays mapped. Not to be taken twice by one thread,
 /// nor held across anything that maps title memory.
 pub fn title_memory_reading(at: usize, len: usize) -> Reading {
+    crate::shadow::lazy_flush_range(at, len);
     if !by_range() {
         return Reading(Held::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
     }
@@ -1065,6 +1174,7 @@ pub fn title_memory_reading(at: usize, len: usize) -> Reading {
 /// runtime changes a mapping of those bytes (or waits to), for a caller
 /// that has another way to read and would rather not wait.
 pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    crate::shadow::lazy_flush_range(at, len);
     if !by_range() {
         return match MAPPING.try_read() {
             Ok(guard) => Some(Reading(Held::All(guard))),
@@ -1084,6 +1194,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Flush or release any lazy GPU-resident `PAGE_NOACCESS` pages before
+    // physical mappings are unmapped or reused (outside `GUARDS` lock).
+    crate::shadow::lazy_flush_range(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1108,25 +1221,41 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
+/// Ensures the process-wide vectored exception handler is installed before
+/// arming lazy GPU-resident `PAGE_NOACCESS` pages.
+pub(crate) fn install_veh() {
+    install();
+}
+
+/// Registers the handler that takes faults on lazy GPU-resident pages and
+/// writes to guarded blocks, once, ahead of the crash reporter's.
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS,
     };
-    unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+    unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let access = r.ExceptionInformation[0];
+        if access != READ && access != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        // Lazy GPU-resident demand flush first (with zero `watch` locks held;
+        // lock-free atomic fast path when no deferred pages are armed).
+        if crate::shadow::lazy_on_fault(at, access == WRITE) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if access != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1143,9 +1272,9 @@ fn install() {
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
+    // SAFETY: the handler only touches our lazy/guard state and protections.
     ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
+        AddVectoredExceptionHandler(1, Some(on_fault));
     });
 }
 
