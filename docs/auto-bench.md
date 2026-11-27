@@ -64,6 +64,13 @@ The JSON output includes:
 
 Replay waits neutrally while `world_frame() == 0` so variable loading times and FPS differences across builds never drift input timing.
 
+### Delivery contract
+
+- **Loading screens (`world_frame == 0`)**: replay holds neutral input (slot 0 connected, no keys) and neither advances playback state nor consumes pending pulses.
+- **Recorded traces (`wframe`)**: step-function holds — the latest recorded entry with `entry.wframe <= world_frame` stays active until the next recorded change.
+- **Multi-frame declarative spans (`to > from`)**: active strictly while `from <= world_frame <= to`; spans never latch past `to` if all frames in `[from, to]` are skipped between polls.
+- **One-frame declarative pulses (`from == to`, `from >= 1`)**: on the live stateful playback path (`ScriptedSource` / `ReplayPlayback`), if no poll occurs during `world_frame == from`, an unpolled pulse in the zero-poll gap (`last_polled_wframe < from <= world_frame`) latches and delivers once on the first eligible polled world frame (`world_frame >= from`), staying consistent across repeated polls and pad/key reads within that single world frame before releasing permanently on the next world frame. Stateless point queries (`Script::pad_at` / `Script::keys_at`) evaluate exact `from <= world_frame <= to`.
+
 ## 3. Automated A/B & Optimization Loop (`tools/bench_loop.py`)
 
 Create a JSON playlist (outside the repository when referencing local capture/game paths):

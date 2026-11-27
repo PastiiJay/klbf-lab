@@ -7,6 +7,23 @@
 //!   declarative range lines (`{"from":0,"to":120,"ly":1.0,"rt":0.8}`) indexed
 //!   by `world_frame()`, holding neutral while `world_frame() == 0` so loading
 //!   screens never desynchronize replay.
+//!
+//! ## Delivery contract
+//! - While `world_frame == 0` (loading screens / menus), replay holds neutral
+//!   input and neither advances playback state nor consumes pulses.
+//! - Recorded state-change traces (`wframe`) behave as step-function holds:
+//!   the latest entry with `entry.wframe <= world_frame` remains active until
+//!   the next recorded change.
+//! - Stateless point lookups (`Script::pad_at`, `Script::keys_at`) evaluate
+//!   declarative ranges strictly at `from <= world_frame <= to`.
+//! - Stateful live playback (`ReplayPlayback` / `ScriptedSource`) guarantees
+//!   once-only delivery for authored 1-frame pulses (`from == to`, `from >= 1`):
+//!   if no poll occurs on world frame `from`, any unpolled pulse in the gap
+//!   `last_polled_wframe < from <= world_frame` latches onto the first eligible
+//!   polled world frame, stays consistent across all polls and pad/key reads
+//!   during that single world frame, and transitions to consumed on the next
+//!   world frame so it never repeats.
+//! - Multi-frame declarative spans (`to > from`) never latch past `to`.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -136,7 +153,12 @@ impl Script {
         Ok(script)
     }
 
-    pub(crate) fn pad_at(&self, wframe: u64, slot: usize) -> Option<PadState> {
+    fn pad_at_matching(
+        &self,
+        wframe: u64,
+        slot: usize,
+        mut range_active: impl FnMut(usize, &RangeEntry) -> bool,
+    ) -> Option<PadState> {
         if slot >= PADS {
             return None;
         }
@@ -152,8 +174,8 @@ impl Script {
                 entry.connected.then_some(entry.pad)
             }
         };
-        for range in &self.ranges {
-            if range.slot == slot && range.from <= wframe && wframe <= range.to {
+        for (idx, range) in self.ranges.iter().enumerate() {
+            if range.slot == slot && range_active(idx, range) {
                 let pad = state.get_or_insert_with(PadState::default);
                 if let Some(b) = range.buttons {
                     pad.buttons |= b;
@@ -181,7 +203,11 @@ impl Script {
         state
     }
 
-    pub(crate) fn keys_at(&self, wframe: u64) -> Vec<KeyState> {
+    fn keys_at_matching(
+        &self,
+        wframe: u64,
+        mut range_active: impl FnMut(usize, &RangeEntry) -> bool,
+    ) -> Vec<KeyState> {
         if wframe == 0 {
             return Vec::new();
         }
@@ -189,8 +215,8 @@ impl Script {
             0 => Vec::new(),
             idx => self.key_traces[idx - 1].keys.clone(),
         };
-        for range in &self.ranges {
-            if range.from <= wframe && wframe <= range.to {
+        for (idx, range) in self.ranges.iter().enumerate() {
+            if range_active(idx, range) {
                 for &k in &range.keys {
                     if !keys.contains(&k) {
                         keys.push(k);
@@ -199,6 +225,104 @@ impl Script {
             }
         }
         keys
+    }
+
+    /// Stateless point-in-time gamepad lookup at exact `wframe` (`from <= wframe <= to`).
+    ///
+    /// For stateful replay with zero-poll 1-frame pulse latching (`from == to`),
+    /// use [`ReplayPlayback`] or [`ScriptedSource`].
+    #[cfg(test)]
+    pub(crate) fn pad_at(&self, wframe: u64, slot: usize) -> Option<PadState> {
+        self.pad_at_matching(wframe, slot, |_, r| r.from <= wframe && wframe <= r.to)
+    }
+
+    /// Stateless point-in-time keyboard lookup at exact `wframe` (`from <= wframe <= to`).
+    ///
+    /// For stateful replay with zero-poll 1-frame pulse latching (`from == to`),
+    /// use [`ReplayPlayback`] or [`ScriptedSource`].
+    #[cfg(test)]
+    pub(crate) fn keys_at(&self, wframe: u64) -> Vec<KeyState> {
+        self.keys_at_matching(wframe, |_, r| r.from <= wframe && wframe <= r.to)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulseState {
+    /// Authored 1-frame pulse (`from == to`) has not yet been delivered.
+    Pending,
+    /// Latched and active for all polls on this single world frame.
+    ActiveOn(u64),
+    /// Already delivered on an earlier world frame; must never repeat.
+    Consumed,
+}
+
+fn range_is_active(
+    pulse_states: &[PulseState],
+    idx: usize,
+    range: &RangeEntry,
+    wframe: u64,
+) -> bool {
+    if range.from == range.to {
+        pulse_states[idx] == PulseState::ActiveOn(wframe)
+    } else {
+        range.from <= wframe && wframe <= range.to
+    }
+}
+
+/// Stateful world-frame replay cursor over a [`Script`] that latches unpolled
+/// 1-frame declarative pulses (`from == to`, `from >= 1`) across zero-poll gaps
+/// so each pulse delivers once on the first eligible world frame and never repeats.
+#[derive(Clone, Debug)]
+pub(crate) struct ReplayPlayback {
+    script: Script,
+    last_polled_wframe: u64,
+    pulse_states: Vec<PulseState>,
+}
+
+impl ReplayPlayback {
+    pub(crate) fn new(script: Script) -> Self {
+        let pulse_states = vec![PulseState::Pending; script.ranges.len()];
+        Self {
+            script,
+            last_polled_wframe: 0,
+            pulse_states,
+        }
+    }
+
+    fn advance_to(&mut self, wframe: u64) {
+        if wframe == 0 || wframe <= self.last_polled_wframe {
+            return;
+        }
+        let prev = self.last_polled_wframe;
+        for (state, range) in self.pulse_states.iter_mut().zip(&self.script.ranges) {
+            if range.from != range.to {
+                continue;
+            }
+            match *state {
+                PulseState::ActiveOn(delivered_wf) if delivered_wf < wframe => {
+                    *state = PulseState::Consumed;
+                }
+                PulseState::Pending if prev < range.from && range.from <= wframe => {
+                    *state = PulseState::ActiveOn(wframe);
+                }
+                _ => {}
+            }
+        }
+        self.last_polled_wframe = wframe;
+    }
+
+    pub(crate) fn pad_at(&mut self, wframe: u64, slot: usize) -> Option<PadState> {
+        self.advance_to(wframe);
+        let states = &self.pulse_states;
+        self.script
+            .pad_at_matching(wframe, slot, |idx, r| range_is_active(states, idx, r, wframe))
+    }
+
+    pub(crate) fn keys_at(&mut self, wframe: u64) -> Vec<KeyState> {
+        self.advance_to(wframe);
+        let states = &self.pulse_states;
+        self.script
+            .keys_at_matching(wframe, |idx, r| range_is_active(states, idx, r, wframe))
     }
 }
 
@@ -304,9 +428,12 @@ fn format_f32(v: f32) -> String {
 
 pub(crate) struct ScriptedSource {
     inner: Box<dyn Source>,
-    replay: Option<Script>,
+    replay: Option<ReplayPlayback>,
     recorder: Option<Recorder>,
-    world_frame: fn() -> u64,
+    world_frame: Box<dyn Fn() -> u64 + Send>,
+    /// World frame latched on `pad(0)` during replay so all pad slots and
+    /// `keys()` in the same `Hub::poll` cycle observe one consistent frame.
+    latched_replay_wframe: Option<u64>,
 }
 
 impl ScriptedSource {
@@ -314,23 +441,33 @@ impl ScriptedSource {
         inner: Box<dyn Source>,
         replay: Option<Script>,
         recorder: Option<Recorder>,
-        world_frame: fn() -> u64,
+        world_frame: impl Fn() -> u64 + Send + 'static,
     ) -> Self {
         Self {
             inner,
-            replay,
+            replay: replay.map(ReplayPlayback::new),
             recorder,
-            world_frame,
+            world_frame: Box::new(world_frame),
+            latched_replay_wframe: None,
         }
     }
 }
 
 impl Source for ScriptedSource {
     fn pad(&mut self, slot: usize) -> Option<PadState> {
-        let wf = (self.world_frame)();
-        let pad = match &self.replay {
-            Some(script) => script.pad_at(wf, slot),
-            None => self.inner.pad(slot),
+        let (wf, pad) = match &mut self.replay {
+            Some(playback) => {
+                let wf = if slot == 0 {
+                    let wf = (self.world_frame)();
+                    self.latched_replay_wframe = Some(wf);
+                    wf
+                } else {
+                    self.latched_replay_wframe
+                        .unwrap_or_else(|| (self.world_frame)())
+                };
+                (wf, playback.pad_at(wf, slot))
+            }
+            None => ((self.world_frame)(), self.inner.pad(slot)),
         };
         if let Some(rec) = &mut self.recorder {
             rec.record_pad(wf, slot, pad);
@@ -339,10 +476,15 @@ impl Source for ScriptedSource {
     }
 
     fn keys(&mut self) -> Vec<KeyState> {
-        let wf = (self.world_frame)();
-        let keys = match &self.replay {
-            Some(script) => script.keys_at(wf),
-            None => self.inner.keys(),
+        let (wf, keys) = match &mut self.replay {
+            Some(playback) => {
+                let wf = self
+                    .latched_replay_wframe
+                    .take()
+                    .unwrap_or_else(|| (self.world_frame)());
+                (wf, playback.keys_at(wf))
+            }
+            None => ((self.world_frame)(), self.inner.keys()),
         };
         if let Some(rec) = &mut self.recorder {
             rec.record_keys(wf, &keys);
@@ -862,5 +1004,103 @@ mod tests {
             assert!(a.iter().all(|p| *p == a[0]));
             assert!(b.iter().all(|p| *p == a[0]));
         }
+    }
+
+    fn replay_source_with_clock(script: Script, clock: Arc<AtomicU64>) -> ScriptedSource {
+        ScriptedSource::with_fn(
+            Box::new(MockSource(Arc::new(Mutex::new(MockHost::default())))),
+            Some(script),
+            None,
+            move || clock.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn one_frame_pulse_latches_across_zero_poll_gap_and_delivers_once() {
+        let script = Script::parse("{\"from\":2,\"to\":2,\"ly\":1.0,\"keys\":[87]}\n").unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut src = replay_source_with_clock(script, Arc::clone(&clock));
+
+        // Poll frames [1, 3, 4]: frame 2 has zero polls, so the 1-frame pulse
+        // latches onto frame 3, stays consistent within frame 3, and clears on frame 4.
+        clock.store(1, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+
+        clock.store(3, Ordering::Relaxed);
+        let p3_first = src.pad(0).unwrap();
+        assert_eq!(p3_first.left_y, 1.0);
+        let k3_first = src.keys();
+        assert_eq!(k3_first.len(), 1);
+        assert_eq!(k3_first[0].virtual_key, 87);
+
+        // Repeated poll within the same delivery world frame keeps the latched pulse active.
+        assert_eq!(src.pad(0).unwrap().left_y, 1.0);
+        assert_eq!(src.keys().len(), 1);
+
+        // Advancing past the delivery world frame releases the pulse permanently.
+        clock.store(4, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+
+        clock.store(5, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+
+        // First world frame skipped after loading screen (`[0, 2, 3]` for `from=1, to=1`).
+        let first_frame_pulse = Script::parse("{\"from\":1,\"to\":1,\"ly\":1.0}\n").unwrap();
+        let clock2 = Arc::new(AtomicU64::new(0));
+        let mut src2 = replay_source_with_clock(first_frame_pulse, Arc::clone(&clock2));
+        assert_eq!(src2.pad(0), Some(PadState::default()));
+        clock2.store(2, Ordering::Relaxed);
+        assert_eq!(src2.pad(0).unwrap().left_y, 1.0);
+        clock2.store(3, Ordering::Relaxed);
+        assert_eq!(src2.pad(0), Some(PadState::default()));
+
+        // Loading-screen pulse (`from=0, to=0`) never leaks into world frame 1.
+        let zero_pulse = Script::parse("{\"from\":0,\"to\":0,\"ly\":1.0}\n").unwrap();
+        let clock3 = Arc::new(AtomicU64::new(0));
+        let mut src3 = replay_source_with_clock(zero_pulse, Arc::clone(&clock3));
+        assert_eq!(src3.pad(0), Some(PadState::default()));
+        clock3.store(1, Ordering::Relaxed);
+        assert_eq!(src3.pad(0), Some(PadState::default()));
+    }
+
+    #[test]
+    fn one_frame_pulse_normal_poll_delivers_once_on_target_frame() {
+        let script = Script::parse("{\"from\":2,\"to\":2,\"ly\":1.0,\"keys\":[87]}\n").unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut src = replay_source_with_clock(script, Arc::clone(&clock));
+
+        // Normal poll sequence [1, 2, 3]: delivers on frame 2, neutral on 1 & 3.
+        clock.store(1, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+
+        clock.store(2, Ordering::Relaxed);
+        assert_eq!(src.pad(0).unwrap().left_y, 1.0);
+        assert_eq!(src.keys().len(), 1);
+        assert_eq!(src.pad(0).unwrap().left_y, 1.0);
+        assert_eq!(src.keys().len(), 1);
+
+        clock.store(3, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+    }
+
+    #[test]
+    fn multi_frame_span_does_not_latch_past_to_across_zero_poll_gap() {
+        let script = Script::parse("{\"from\":2,\"to\":3,\"ly\":1.0,\"keys\":[87]}\n").unwrap();
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut src = replay_source_with_clock(script, Arc::clone(&clock));
+
+        // Multi-frame span (to > from) polled at [1, 4] must NOT latch past `to`.
+        clock.store(1, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
+
+        clock.store(4, Ordering::Relaxed);
+        assert_eq!(src.pad(0), Some(PadState::default()));
+        assert!(src.keys().is_empty());
     }
 }
