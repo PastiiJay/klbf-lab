@@ -224,6 +224,28 @@ class BenchLoopTests(unittest.TestCase):
             self.assertEqual(entry["decision"], "reject")
             self.assertFalse(entry["gates"]["gate3_draw_parity"]["passed"])
 
+    def test_reject_if_only_candidate_reports_the_configured_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc, entry = self.run_ab_case(
+                Path(d),
+                make_payload(median_ms=20.0, input_sha=None),
+                make_payload(median_ms=17.0),
+                scene_overrides={"input_script": "route.jsonl"},
+            )
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(entry["decision"], "reject")
+            self.assertFalse(entry["gates"]["gate3_draw_parity"]["passed"])
+
+            rc_both_null, entry_both_null = self.run_ab_case(
+                Path(d),
+                make_payload(median_ms=20.0, input_sha=None),
+                make_payload(median_ms=17.0, input_sha=None),
+                scene_overrides={"input_script": "route.jsonl"},
+            )
+            self.assertNotEqual(rc_both_null, 0)
+            self.assertEqual(entry_both_null["decision"], "reject")
+            self.assertFalse(entry_both_null["gates"]["gate3_draw_parity"]["passed"])
+
     def test_reject_on_input_script_sha_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             rc, entry = self.run_ab_case(

@@ -572,9 +572,11 @@ def evaluate_gates(
                 )
         if c.input_script_mismatch or b.input_script_mismatch:
             draw_errors.append(f"{spec.name}: input_script_sha256 varied across repeats")
+        if spec.input_script and not b.input_script_sha256:
+            draw_errors.append(f"{spec.name}: input_script configured but baseline reported null input_script_sha256")
         if spec.input_script and not c.input_script_sha256:
             draw_errors.append(f"{spec.name}: input_script configured but candidate reported null input_script_sha256")
-        if b.input_script_sha256 and c.input_script_sha256 != b.input_script_sha256:
+        if (b.input_script_sha256 or c.input_script_sha256) and c.input_script_sha256 != b.input_script_sha256:
             draw_errors.append(
                 f"{spec.name}: input_script_sha256 mismatch (cand={c.input_script_sha256!r} vs base={b.input_script_sha256!r})"
             )

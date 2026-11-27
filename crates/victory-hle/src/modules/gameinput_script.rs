@@ -499,6 +499,29 @@ impl Source for ScriptedSource {
     }
 }
 
+fn load_replay_script(path: &str, register: impl FnOnce(&[u8]) -> String) -> Option<Script> {
+    match std::fs::read(path) {
+        Ok(bytes) => match std::str::from_utf8(&bytes)
+            .map_err(|e| format!("invalid UTF-8: {e}"))
+            .and_then(Script::parse)
+        {
+            Ok(script) => {
+                let sha = register(&bytes);
+                tracing::info!(path, sha256 = %sha, "replaying scripted world-frame inputs");
+                Some(script)
+            }
+            Err(err) => {
+                tracing::error!(path, error = %err, "failed to parse VICTORY_INPUT_REPLAY");
+                None
+            }
+        },
+        Err(err) => {
+            tracing::error!(path, error = %err, "failed to read VICTORY_INPUT_REPLAY");
+            None
+        }
+    }
+}
+
 /// Wraps `source` with input replay and/or recording when `VICTORY_INPUT_REPLAY`
 /// or `VICTORY_INPUT_RECORD` is configured.
 pub(crate) fn wrap(source: Box<dyn Source>) -> Box<dyn Source> {
@@ -513,28 +536,9 @@ pub(crate) fn wrap(source: Box<dyn Source>) -> Box<dyn Source> {
         return source;
     }
 
-    let replay = replay_path.and_then(|path| match std::fs::read(&path) {
-        Ok(bytes) => {
-            let sha = victory_gpu::bench::register_input_script(&bytes);
-            match std::str::from_utf8(&bytes)
-                .map_err(|e| format!("invalid UTF-8: {e}"))
-                .and_then(Script::parse)
-            {
-                Ok(script) => {
-                    tracing::info!(path, sha256 = %sha, "replaying scripted world-frame inputs");
-                    Some(script)
-                }
-                Err(err) => {
-                    tracing::error!(path, error = %err, "failed to parse VICTORY_INPUT_REPLAY");
-                    None
-                }
-            }
-        }
-        Err(err) => {
-            tracing::error!(path, error = %err, "failed to read VICTORY_INPUT_REPLAY");
-            None
-        }
-    });
+    let replay = replay_path
+        .as_deref()
+        .and_then(|path| load_replay_script(path, victory_gpu::bench::register_input_script));
 
     let recorder = record_path.and_then(|path| match Recorder::create(Path::new(&path)) {
         Ok(rec) => {
@@ -1102,5 +1106,31 @@ mod tests {
         clock.store(4, Ordering::Relaxed);
         assert_eq!(src.pad(0), Some(PadState::default()));
         assert!(src.keys().is_empty());
+    }
+
+    #[test]
+    fn invalid_replay_script_does_not_register_digest_until_parse_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("invalid.jsonl");
+        std::fs::write(&bad_path, "{not valid json\n").unwrap();
+
+        let mut registered = Vec::new();
+        let bad_res = load_replay_script(bad_path.to_str().unwrap(), |bytes| {
+            registered.push(bytes.to_vec());
+            "unexpected".to_owned()
+        });
+        assert!(bad_res.is_none());
+        assert!(registered.is_empty());
+
+        let good_path = dir.path().join("valid.jsonl");
+        let good_bytes = b"{\"from\":1,\"to\":2,\"ly\":1.0}\n";
+        std::fs::write(&good_path, good_bytes).unwrap();
+        let good_res = load_replay_script(good_path.to_str().unwrap(), |bytes| {
+            registered.push(bytes.to_vec());
+            "ok-digest".to_owned()
+        });
+        assert!(good_res.is_some());
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0], good_bytes);
     }
 }
