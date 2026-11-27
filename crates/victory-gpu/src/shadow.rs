@@ -15,14 +15,383 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Self-contained Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) helpers kept
+/// inside `shadow.rs` (opt-in via `VICTORY_REBAR=1|2`, default OFF).
+mod rebar {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kind {
+        Window,
+        Buffer,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Decision {
+        Rebar,
+        Off,
+        Unsupported,
+        NotThisKind,
+        CpuRead,
+        OverBudget,
+        CardFull,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Ask {
+        pub level: u8,
+        pub supported: bool,
+        pub kind: Kind,
+        pub size: u64,
+        pub cpu_read: bool,
+        pub placed: u64,
+        pub most: u64,
+        pub card: Option<(u64, u64)>,
+    }
+
+    fn card_limit_bytes(budget: u64, percent: u64) -> u64 {
+        ((u128::from(budget) * u128::from(percent)) / 100) as u64
+    }
+
+    fn vram_percent() -> u64 {
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("VICTORY_REBAR_VRAM_PERCENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(80, |p| p.clamp(50, 90))
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn decide(ask: &Ask) -> Decision {
+        decide_with_percent(ask, 80)
+    }
+
+    fn decide_with_percent(ask: &Ask, vram_pct: u64) -> Decision {
+        if ask.level == 0 {
+            return Decision::Off;
+        }
+        if !ask.supported {
+            return Decision::Unsupported;
+        }
+        if ask.cpu_read {
+            return Decision::CpuRead;
+        }
+        match ask.kind {
+            Kind::Window => {}
+            Kind::Buffer if ask.level >= 2 => {}
+            Kind::Buffer => return Decision::NotThisKind,
+        }
+        if ask.placed.saturating_add(ask.size) > ask.most {
+            return Decision::OverBudget;
+        }
+        if let Some((budget, used)) = ask.card
+            && used.saturating_add(ask.size) > card_limit_bytes(budget, vram_pct)
+        {
+            return Decision::CardFull;
+        }
+        Decision::Rebar
+    }
+
+    pub(super) fn level_of(value: Option<&str>) -> u8 {
+        match value.map(str::trim) {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn default_most(card_budget: Option<u64>) -> u64 {
+        match card_budget {
+            Some(b) => (b / 4).min(4 << 30),
+            None => 256 << 20,
+        }
+    }
+
+    pub(super) fn level() -> u8 {
+        static LEVEL: OnceLock<u8> = OnceLock::new();
+        *LEVEL.get_or_init(|| level_of(std::env::var("VICTORY_REBAR").ok().as_deref()))
+    }
+
+    pub(super) fn supported() -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let Some(host) = crate::host::host() else {
+                return false;
+            };
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: plain feature query filling our local structure.
+            let ok = unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut o16).cast(),
+                        size_of_val(&o16) as u32,
+                    )
+                    .is_ok()
+            };
+            ok && o16.GPUUploadHeapSupported.as_bool()
+        })
+    }
+
+    fn most() -> u64 {
+        static MOST: OnceLock<u64> = OnceLock::new();
+        *MOST.get_or_init(|| {
+            let env = std::env::var("VICTORY_REBAR_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            match env {
+                Some(mb) => mb.saturating_mul(1 << 20),
+                None => {
+                    let budget = crate::host::host()
+                        .and_then(|h| h.video_memory())
+                        .map(|[b, ..]| b);
+                    default_most(budget)
+                }
+            }
+        })
+    }
+
+    static PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+    fn reserve_bytes(placed: &AtomicU64, size: u64, most: u64) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let mut used = placed.load(Ordering::Relaxed);
+        loop {
+            let next = used.checked_add(size).filter(|&n| n <= most)?;
+            match placed.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(next),
+                Err(cur) => used = cur,
+            }
+        }
+    }
+
+    fn reserve_with_card(
+        placed: &AtomicU64,
+        in_flight: &AtomicU64,
+        size: u64,
+        most: u64,
+        card: Option<(u64, u64)>,
+        vram_pct: u64,
+    ) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let Some((budget, used)) = card else {
+            let next = reserve_bytes(placed, size, most)?;
+            in_flight.fetch_add(size, Ordering::Release);
+            return Some(next);
+        };
+        let limit = card_limit_bytes(budget, vram_pct);
+        let mut cur = in_flight.load(Ordering::Acquire);
+        loop {
+            let effective_used = used.checked_add(cur)?;
+            let next_used = effective_used.checked_add(size)?;
+            if next_used > limit {
+                return None;
+            }
+            let next = cur + size;
+            match in_flight.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        match reserve_bytes(placed, size, most) {
+            Some(next) => Some(next),
+            None => {
+                in_flight.fetch_sub(size, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    pub(super) struct Reservation {
+        size: u64,
+        committed: bool,
+    }
+
+    impl Reservation {
+        pub(super) fn commit(mut self) -> u64 {
+            self.committed = true;
+            IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+            self.size
+        }
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            if !self.committed {
+                IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+                released(self.size);
+            }
+        }
+    }
+
+    pub(super) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> Option<Reservation> {
+        let level = level();
+        if size == 0 || level == 0 || !supported() || cpu_read {
+            return None;
+        }
+        if matches!(kind, Kind::Buffer) && level < 2 {
+            return None;
+        }
+        let most = most();
+        let placed = PLACED[0].load(Ordering::Relaxed);
+        if placed.saturating_add(size) > most {
+            PLACED[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let card = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[b, u, ..]| (b, u));
+        let vram_pct = vram_percent();
+        let ask = Ask {
+            level,
+            supported: true,
+            kind,
+            size,
+            cpu_read,
+            placed,
+            most,
+            card: card.map(|(b, u)| (b, u.saturating_add(IN_FLIGHT.load(Ordering::Acquire)))),
+        };
+        let reserved = match decide_with_percent(&ask, vram_pct) {
+            Decision::Rebar => reserve_with_card(&PLACED[0], &IN_FLIGHT, size, most, card, vram_pct),
+            Decision::OverBudget | Decision::CardFull => None,
+            _ => return None,
+        };
+        if reserved.is_none() {
+            PLACED[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        PLACED[1].fetch_add(1, Ordering::Relaxed);
+        Some(Reservation {
+            size,
+            committed: false,
+        })
+    }
+
+    pub(super) fn released(size: u64) {
+        PLACED[0].fetch_sub(size, Ordering::Relaxed);
+        PLACED[1].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn gpu_upload_buffer(
+        host: &crate::host::Host,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and persistent mapping of a GPU upload buffer.
+        let made = unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no GPU upload buffer (ReBAR)");
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+
+        #[test]
+        fn rebar_decisions_and_concurrent_headroom_hold() {
+            let mut ask = Ask {
+                level: 1,
+                supported: true,
+                kind: Kind::Window,
+                size: 4 * MIB,
+                cpu_read: false,
+                placed: 0,
+                most: GIB,
+                card: Some((12 * GIB, 2 * GIB)),
+            };
+            assert_eq!(decide(&ask), Decision::Rebar);
+            ask.kind = Kind::Buffer;
+            assert_eq!(decide(&ask), Decision::NotThisKind);
+            ask.level = 2;
+            assert_eq!(decide(&ask), Decision::Rebar);
+            ask.cpu_read = true;
+            assert_eq!(decide(&ask), Decision::CpuRead);
+
+            let placed = AtomicU64::new(512 * MIB);
+            let in_flight = AtomicU64::new(0);
+            let budget = 12 * GIB;
+            let used = card_limit_bytes(budget, 80) - 4 * MIB;
+            let gate = std::sync::Barrier::new(8);
+            let accepted = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            gate.wait();
+                            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, used)), 80)
+                        })
+                    })
+                    .collect();
+                workers.into_iter().filter_map(|w| w.join().unwrap()).count()
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(placed.load(Ordering::Relaxed), 516 * MIB);
+            assert_eq!(in_flight.load(Ordering::Relaxed), 4 * MIB);
+            assert_eq!(card_limit_bytes(105, 80), 84);
+        }
+    }
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -71,6 +440,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Bytes reserved in ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`); 0 when in system RAM or carded.
+    rebar: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -724,6 +1095,208 @@ impl Flights {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+/// Drains write-combining buffers after sequential CPU stores into a ReBAR
+/// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) mapping so subsequent reads or GPU work
+/// observe the completed writes in order.
+#[inline]
+fn wc_sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SFENCE is part of baseline SSE2 on every x86-64 CPU.
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+/// Copies `len` bytes from write-combined (USWC) memory (`src`, e.g. a ReBAR
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` mapping) into cached system memory (`dst`).
+/// Uses AVX2 `VMOVNTDQA` streaming loads on 32-byte aligned addresses bracketed
+/// by `_mm_mfence()` so streaming loads cannot bypass prior same-core WC stores
+/// or reorder past following WC stores or synchronization loads.
+///
+/// # Safety
+/// `src` must be valid for reads of `len` bytes, `dst` valid for writes of
+/// `len` bytes, and the two ranges must not overlap.
+unsafe fn copy_from_wc(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        unsafe { copy_from_wc_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: caller's bounds and non-overlap guarantee.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_from_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_mfence, _mm256_storeu_si256, _mm256_stream_load_si256};
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE before any following WC stores or reads.
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
+    let prefix = src.align_offset(32).min(len);
+    if prefix > 0 {
+        // SAFETY: `prefix <= len`.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, prefix) };
+    }
+    let mut at = prefix;
+    while at + 256 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+        unsafe {
+            let s = src.add(at);
+            let d = dst.add(at);
+            let v0 = _mm256_stream_load_si256(s.cast::<__m256i>());
+            let v1 = _mm256_stream_load_si256(s.add(32).cast::<__m256i>());
+            let v2 = _mm256_stream_load_si256(s.add(64).cast::<__m256i>());
+            let v3 = _mm256_stream_load_si256(s.add(96).cast::<__m256i>());
+            let v4 = _mm256_stream_load_si256(s.add(128).cast::<__m256i>());
+            let v5 = _mm256_stream_load_si256(s.add(160).cast::<__m256i>());
+            let v6 = _mm256_stream_load_si256(s.add(192).cast::<__m256i>());
+            let v7 = _mm256_stream_load_si256(s.add(224).cast::<__m256i>());
+            _mm256_storeu_si256(d.cast::<__m256i>(), v0);
+            _mm256_storeu_si256(d.add(32).cast::<__m256i>(), v1);
+            _mm256_storeu_si256(d.add(64).cast::<__m256i>(), v2);
+            _mm256_storeu_si256(d.add(96).cast::<__m256i>(), v3);
+            _mm256_storeu_si256(d.add(128).cast::<__m256i>(), v4);
+            _mm256_storeu_si256(d.add(160).cast::<__m256i>(), v5);
+            _mm256_storeu_si256(d.add(192).cast::<__m256i>(), v6);
+            _mm256_storeu_si256(d.add(224).cast::<__m256i>(), v7);
+        }
+        at += 256;
+    }
+    while at + 32 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        unsafe {
+            let v = _mm256_stream_load_si256(src.add(at).cast::<__m256i>());
+            _mm256_storeu_si256(dst.add(at).cast::<__m256i>(), v);
+        }
+        at += 32;
+    }
+    if at < len {
+        // SAFETY: remaining tail within `len`.
+        unsafe { std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at) };
+    }
+}
+
+/// Compares `len` bytes of write-combined memory (`wc_src`) against cached
+/// memory (`cached`) using AVX2 `VMOVNTDQA` streaming loads on aligned
+/// addresses bracketed by `_mm_mfence()`.
+///
+/// # Safety
+/// Both `wc_src` and `cached` must be valid for reads of `len` bytes.
+unsafe fn slices_equal_wc(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        return unsafe { slices_equal_wc_avx2(wc_src, cached, len) };
+    }
+    // SAFETY: caller's bounds guarantee.
+    unsafe {
+        std::slice::from_raw_parts(wc_src, len) == std::slice::from_raw_parts(cached, len)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn slices_equal_wc_avx2(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm_mfence, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_stream_load_si256,
+    };
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE on every return path (including early `false`).
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
+    let prefix = wc_src.align_offset(32).min(len);
+    for i in 0..prefix {
+        // SAFETY: `i < prefix <= len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    let mut at = prefix;
+    const BLOCK: usize = 4096;
+    while at + 256 <= len {
+        let block_end = at.saturating_add(BLOCK).min(len - (len - at) % 256);
+        let mut acc0 = _mm256_set1_epi8(-1);
+        let mut acc1 = _mm256_set1_epi8(-1);
+        while at < block_end {
+            // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+            unsafe {
+                let w = wc_src.add(at);
+                let c = cached.add(at);
+                let w0 = _mm256_stream_load_si256(w.cast::<__m256i>());
+                let w1 = _mm256_stream_load_si256(w.add(32).cast::<__m256i>());
+                let w2 = _mm256_stream_load_si256(w.add(64).cast::<__m256i>());
+                let w3 = _mm256_stream_load_si256(w.add(96).cast::<__m256i>());
+                let w4 = _mm256_stream_load_si256(w.add(128).cast::<__m256i>());
+                let w5 = _mm256_stream_load_si256(w.add(160).cast::<__m256i>());
+                let w6 = _mm256_stream_load_si256(w.add(192).cast::<__m256i>());
+                let w7 = _mm256_stream_load_si256(w.add(224).cast::<__m256i>());
+                let e0 = _mm256_cmpeq_epi8(w0, _mm256_loadu_si256(c.cast::<__m256i>()));
+                let e1 = _mm256_cmpeq_epi8(w1, _mm256_loadu_si256(c.add(32).cast::<__m256i>()));
+                let e2 = _mm256_cmpeq_epi8(w2, _mm256_loadu_si256(c.add(64).cast::<__m256i>()));
+                let e3 = _mm256_cmpeq_epi8(w3, _mm256_loadu_si256(c.add(96).cast::<__m256i>()));
+                let e4 = _mm256_cmpeq_epi8(w4, _mm256_loadu_si256(c.add(128).cast::<__m256i>()));
+                let e5 = _mm256_cmpeq_epi8(w5, _mm256_loadu_si256(c.add(160).cast::<__m256i>()));
+                let e6 = _mm256_cmpeq_epi8(w6, _mm256_loadu_si256(c.add(192).cast::<__m256i>()));
+                let e7 = _mm256_cmpeq_epi8(w7, _mm256_loadu_si256(c.add(224).cast::<__m256i>()));
+                acc0 = _mm256_and_si256(acc0, _mm256_and_si256(_mm256_and_si256(e0, e1), _mm256_and_si256(e2, e3)));
+                acc1 = _mm256_and_si256(acc1, _mm256_and_si256(_mm256_and_si256(e4, e5), _mm256_and_si256(e6, e7)));
+            }
+            at += 256;
+        }
+        if _mm256_movemask_epi8(_mm256_and_si256(acc0, acc1)) != -1i32 {
+            return false;
+        }
+    }
+    while at + 32 <= len {
+        // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        let eq = unsafe {
+            let w = _mm256_stream_load_si256(wc_src.add(at).cast::<__m256i>());
+            let c = _mm256_loadu_si256(cached.add(at).cast::<__m256i>());
+            _mm256_cmpeq_epi8(w, c)
+        };
+        if _mm256_movemask_epi8(eq) != -1i32 {
+            return false;
+        }
+        at += 32;
+    }
+    for i in at..len {
+        // SAFETY: `i < len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    true
+}
+
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
@@ -750,6 +1323,123 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
+/// Merges GPU-written bytes (`gpu != old && title == old`) into `title` without
+/// mutating `gpu` or `old`, recording the exact title-written runs into `runs`.
+/// Used by the WC ReBAR path of [`Shadow::copy_back_with`] so `gpu` stays
+/// intact as the baseline for [`changed_runs`] while preserving upstream #2009
+/// title-wins conflict semantics.
+fn merge_gpu_into_title_runs(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    runs.clear();
+    let n = title.len().min(gpu.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_gpu_into_title_runs_avx2(&mut title[..n], &gpu[..n], &old[..n], runs) };
+    }
+    merge_gpu_into_title_runs_scalar(&mut title[..n], &gpu[..n], &old[..n], runs)
+}
+
+fn merge_gpu_into_title_runs_scalar(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut run_start: Option<usize> = None;
+    for (i, ((t, &g), &o)) in title.iter_mut().zip(gpu).zip(old).enumerate() {
+        if g != o && *t == o {
+            *t = g;
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, title.len() - start));
+    }
+    !runs.is_empty()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_into_title_runs_avx2(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_storeu_si256,
+    };
+    let n = title.len();
+    let (tp, gp, op) = (title.as_mut_ptr(), gpu.as_ptr(), old.as_ptr());
+    let mut run_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        let diff = unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vg = _mm256_loadu_si256(gp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_go = _mm256_cmpeq_epi8(vg, vo);
+            let eq_to = _mm256_cmpeq_epi8(vt, vo);
+            let gpu_wins = _mm256_andnot_si256(eq_go, eq_to);
+            let mask = _mm256_movemask_epi8(gpu_wins) as u32;
+            if mask != 0 {
+                let merged = _mm256_blendv_epi8(vt, vg, gpu_wins);
+                _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+            }
+            mask
+        };
+        if diff == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        } else if diff == u32::MAX {
+            run_start.get_or_insert(i);
+        } else {
+            let mut pos = 0usize;
+            while pos < 32 {
+                let rem = diff >> pos;
+                if run_start.is_some() {
+                    let ones = (rem.trailing_ones() as usize).min(32 - pos);
+                    pos += ones;
+                    if pos < 32 {
+                        let start = run_start.take().expect("checked is_some above");
+                        runs.push((start, i + pos - start));
+                    }
+                } else {
+                    if rem == 0 {
+                        break;
+                    }
+                    pos += rem.trailing_zeros() as usize;
+                    run_start = Some(i + pos);
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        if gpu[i] != old[i] && title[i] == old[i] {
+            title[i] = gpu[i];
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, n - start));
+    }
+    !runs.is_empty()
+}
+
 pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
@@ -1267,11 +1957,18 @@ const PIECE: usize = 64 << 10;
 
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
-/// one thread copies some 8 GB/s.
+/// one thread copies some 8 GB/s. When `src_wc` is true (`src` is
+/// write-combined ReBAR memory), uses single-threaded AVX2 `VMOVNTDQA`
+/// streaming loads bracketed by `_mm_mfence()`.
 ///
 /// # Safety
 /// Both ranges are valid for `len` bytes and do not overlap.
-unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
+unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize, src_wc: bool) {
+    if src_wc {
+        // SAFETY: caller's bounds and non-overlap guarantee.
+        unsafe { copy_from_wc(src, dst, len) };
+        return;
+    }
     const PER_THREAD: usize = 16 << 20;
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
@@ -1320,6 +2017,10 @@ pub(crate) fn wide_back() -> bool {
 }
 
 type Job = Box<dyn FnOnce() + Send>;
+
+thread_local! {
+    static SCRATCH_WC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
@@ -1407,24 +2108,53 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 const WIDE_JOB: usize = 1 << 20;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
-/// (from, to, bytes), taken by [`take_snapshots`].
-static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// (from, to, bytes, src_is_wc), taken by [`take_snapshots`].
+static SNAPS: Mutex<Vec<(usize, usize, usize, bool)>> = Mutex::new(Vec::new());
 
 /// With [`wide_back`], when a submission's refreshes are done and before
-/// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
-/// Nothing to do without the switch.
+/// its shaders run: takes every snapshot noted since the last submit.
 pub(crate) fn take_snapshots() {
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    wide(copy_jobs_wc(snaps));
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
+#[cfg(test)]
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    copy_jobs_wc(
+        copies
+            .into_iter()
+            .map(|(src, dst, len)| (src, dst, len, false))
+            .collect(),
+    )
+}
+
+/// `copies` (from, to, bytes, src_is_wc) as pieces of work of about
+/// [`WIDE_JOB`] bytes each; WC BAR reads serialized on one worker so
+/// concurrent cores never thrash the PCIe read queue.
+fn copy_jobs_wc(copies: Vec<(usize, usize, usize, bool)>) -> Vec<Job> {
+    let mut cached = Vec::new();
+    let mut wc = Vec::new();
+    for entry in copies {
+        if entry.3 {
+            wc.push((entry.0, entry.1, entry.2));
+        } else {
+            cached.push((entry.0, entry.1, entry.2));
+        }
+    }
     let mut jobs: Vec<Job> = Vec::new();
+    if !wc.is_empty() {
+        jobs.push(Box::new(move || {
+            for (src, dst, len) in wc {
+                // SAFETY: a ReBAR WC mapping and its cached snapshot, non-overlapping.
+                unsafe { copy_from_wc(src as *const u8, dst as *mut u8, len) };
+            }
+        }));
+    }
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
@@ -1439,7 +2169,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
             }));
         }
     };
-    for (src, dst, len) in copies {
+    for (src, dst, len) in cached {
         let mut at = 0;
         while at < len {
             let n = (WIDE_JOB - bytes).min(len - at);
@@ -1468,28 +2198,43 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+                Some(before) => (
+                    shadow.data as usize,
+                    before.as_ptr() as usize,
+                    shadow.start as usize,
+                    from,
+                    to,
+                    shadow.rebar != 0,
+                ),
+                None => (0, 0, 0, 0, 0, false),
             }
         })
         .collect();
-    find_pieces(scans)
+    find_pieces_wc(scans)
+}
+
+#[cfg(test)]
+fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+    find_pieces_wc(
+        scans
+            .into_iter()
+            .map(|(data, before, start, from, to)| (data, before, start, from, to, false))
+            .collect(),
+    )
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
-/// are, the title address the copy starts at, offsets from and to): the
-/// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
-/// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
-/// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+/// are, the title address the copy starts at, offsets from and to, whether
+/// the copy pointer is write-combined): the 64 KiB pieces that differ.
+fn find_pieces_wc(scans: Vec<(usize, usize, usize, usize, usize, bool)>) -> Vec<Vec<(usize, usize)>> {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
-    // A job's part of a scan: the scan, then which and place.
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
+    // A job's part of a scan: the scan, then is_wc, which, and place.
+    type Part = (usize, usize, usize, usize, usize, bool, usize, usize);
     let found: Arc<Mutex<Found>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
+    let mut wc_group: Vec<Part> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
@@ -1500,7 +2245,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         let found = found.clone();
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
+            for (data, before, start, from, to, is_wc, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
@@ -1509,13 +2254,15 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
                     // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
+                    let same = if is_wc {
+                        unsafe { slices_equal_wc((data + at) as *const u8, (before + at) as *const u8, n) }
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts((data + at) as *const u8, n)
+                                == std::slice::from_raw_parts((before + at) as *const u8, n)
+                        }
                     };
-                    if now != old {
+                    if !same {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1526,7 +2273,13 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+    for (which, (data, before, start, from, to, is_wc)) in scans.into_iter().enumerate() {
+        if is_wc {
+            if from < to {
+                wc_group.push((data, before, start, from, to, true, which, 0));
+            }
+            continue;
+        }
         let (mut at, mut place) = (from, 0);
         while at < to {
             // Cut where pieces end, so that every job sees whole pieces.
@@ -1538,7 +2291,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     next = (at + PIECE - (start + at) % PIECE).min(to);
                 }
             }
-            group.push((data, before, start, at, next, which, place));
+            group.push((data, before, start, at, next, false, which, place));
             bytes += next - at;
             place += 1;
             at = next;
@@ -1548,6 +2301,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
             }
         }
     }
+    flush(&mut wc_group, &mut jobs);
     flush(&mut group, &mut jobs);
     wide(jobs);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1913,6 +2667,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2285,6 +3042,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            rebar: 0,
             place: None,
         }
     }
@@ -2373,6 +3131,7 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        let is_wc = self.rebar != 0;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
@@ -2399,7 +3158,11 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        if is_wc {
+                            copy_from_wc(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        } else {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
@@ -2414,7 +3177,12 @@ impl Shadow {
             // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
-            snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            snaps.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (data + from, snapshot + from, to - from, is_wc)),
+            );
             return;
         }
         for (from, to) in parts {
@@ -2422,7 +3190,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from, is_wc);
                 }
             }
         }
@@ -2483,26 +3251,79 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
+            let is_wc = self.rebar != 0;
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
-                    continue;
-                };
-                let at = at + first;
-                crate::watch::writing(start + at, n);
-                // Only the GPU's bytes (upstream #2009): the rest of the
-                // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
+            SCRATCH_WC.with(|wc_cell| {
+                let mut wc_buf = wc_cell.borrow_mut();
+                if is_wc && wc_buf.len() < PIECE {
+                    wc_buf.resize(PIECE, 0);
                 }
-            }
+                for (at, n) in differing {
+                    let old = &before[at - from..at - from + n];
+                    if is_wc {
+                        // Copy WC GPU upload memory into L1-cached scratch ONCE
+                        // via AVX2 streaming loads (`VMOVNTDQA`), diff and merge
+                        // in cached memory, and store back only title-modified
+                        // runs followed by `_mm_sfence()`.
+                        let wc_slice = &mut wc_buf[..n];
+                        // SAFETY: inside the ReBAR mapping; `n <= PIECE`.
+                        unsafe { copy_from_wc(self.data.add(at), wc_slice.as_mut_ptr(), n) };
+                        let Some(first) = first_difference(wc_slice, old) else {
+                            continue;
+                        };
+                        let last = last_difference(wc_slice, old).unwrap_or(first);
+                        let (at, n) = (at + first, last + 1 - first);
+                        let host_orig = &wc_slice[first..=last];
+                        let old = &old[first..=last];
+                        title.clear();
+                        title.resize(n, 0);
+                        if !crate::host::read_into((start + at) as *const u8, &mut title) {
+                            continue;
+                        }
+                        let differs = merge_gpu_into_title_runs(&mut title, host_orig, old, &mut runs);
+                        let wc_runs = changed_runs(&title, host_orig);
+                        for &(run_at, run_len) in &wc_runs {
+                            // SAFETY: inside the ReBAR mapping; sequential WC store.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    title.as_ptr().add(run_at),
+                                    self.data.add(at + run_at),
+                                    run_len,
+                                );
+                            }
+                        }
+                        if !wc_runs.is_empty() {
+                            wc_sfence();
+                        }
+                        if differs {
+                            crate::watch::writing(start + at, n);
+                            for &(off, len) in &runs {
+                                crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                                written += len;
+                            }
+                        }
+                    } else {
+                        // SAFETY: inside the mapping; only the submitting thread
+                        // writes it.
+                        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let read = |first: usize, title: &mut [u8]| {
+                            crate::host::read_into((start + at + first) as *const u8, title)
+                        };
+                        let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                            continue;
+                        };
+                        let at = at + first;
+                        crate::watch::writing(start + at, n);
+                        // Only the GPU's bytes (upstream #2009): the rest of the
+                        // stretch is the title's as read, and a title write landing
+                        // there since stays.
+                        for &(off, len) in &runs {
+                            crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                            written += len;
+                        }
+                    }
+                }
+            });
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
             // frame). Asking about the whole range here, to note them
@@ -2563,7 +3384,11 @@ impl Shadow {
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            if self.rebar != 0 {
+                copy_from_wc(self.data.add(at), now.as_mut_ptr(), n);
+            } else {
+                std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            }
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -2601,7 +3426,7 @@ impl Shadow {
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
+        let (start, data, is_wc) = (self.start as usize, self.data as usize, self.rebar != 0);
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
@@ -2609,8 +3434,12 @@ impl Shadow {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                let same = if is_wc {
+                    unsafe { slices_equal_wc((data + at) as *const u8, before[at - from..].as_ptr(), n) }
+                } else {
+                    unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) == &before[at - from..at - from + n] }
+                };
+                if !same {
                     found.push((at, n));
                 }
                 at += n;
@@ -2618,7 +3447,7 @@ impl Shadow {
             found
         };
         const PER_THREAD: usize = 16 << 20;
-        let threads = ((to - from) / PER_THREAD).clamp(1, 8);
+        let threads = if is_wc { 1 } else { ((to - from) / PER_THREAD).clamp(1, 8) };
         if threads == 1 {
             return scan(from, to);
         }
@@ -2864,7 +3693,8 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    let runs = changed_runs(title, held);
+                    for &(r, m) in &runs {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
@@ -2872,6 +3702,9 @@ impl Shadow {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    if self.rebar != 0 && !runs.is_empty() {
+                        wc_sfence();
                     }
                 }
                 drop(before);
@@ -2977,14 +3810,21 @@ impl Shadow {
         static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
         static SAID: AtomicU64 = AtomicU64::new(0);
         let start = self.start as usize;
+        let is_wc = self.rebar != 0;
         let mut title = [0u8; SAMPLE];
+        let mut wc_sample = [0u8; SAMPLE];
         let mut at = from;
         while at < to {
             let n = SAMPLE.min(to - at);
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = if is_wc {
+                    unsafe { copy_from_wc(self.data.add(at - start).cast_const(), wc_sample.as_mut_ptr(), n) };
+                    &wc_sample[..n]
+                } else {
+                    unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) }
+                };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -3056,9 +3896,15 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.rebar != 0 {
+            wc_sfence();
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -3438,12 +4284,17 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory, and the CPU side stays in system RAM; otherwise opt-in ReBAR
+        // (`VICTORY_REBAR=2`) places the host copy in `D3D12_HEAP_TYPE_GPU_UPLOAD`.
+        let on_card = card_for(size);
+        let (buffer, data, card, rebar) = match on_card {
             Some(on_card) => {
+                let Some((staging, data)) = host()?.shared_buffer(size) else {
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -3451,15 +4302,25 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
                 };
-                (on_card, Some(card))
+                (on_card, data, Some(card), 0)
             }
-            None => (buffer, None),
+            None => match rebar_copy(rebar::Kind::Buffer, size) {
+                Some((buffer, data, rebar)) => {
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} (ReBAR)", key.0));
+                    (buffer, data, None, rebar)
+                }
+                None => {
+                    let (buffer, data) = host()?.shared_buffer(size)?;
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                    (buffer, data, None, 0)
+                }
+            },
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3478,6 +4339,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.rebar = rebar;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3659,23 +4521,38 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the CPU side stays in system RAM; otherwise opt-in
+    // ReBAR (`VICTORY_REBAR=1|2`) places the window in `GPU_UPLOAD`.
+    let on_card = window_card_for(len);
+    let (buffer, data, card, rebar) = match on_card {
         Some(on_card) => {
+            let Some((staging, data)) = host()?.shared_buffer(len) else {
+                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                return None;
+            };
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
             };
-            (on_card, Some(card))
+            (on_card, data, Some(card), 0)
         }
-        None => (buffer, None),
+        None => match rebar_copy(rebar::Kind::Window, len) {
+            Some((buffer, data, rebar)) => {
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} (ReBAR)"));
+                (buffer, data, None, rebar)
+            }
+            None => {
+                let (buffer, data) = host()?.shared_buffer(len)?;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                (buffer, data, None, 0)
+            }
+        },
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -3687,6 +4564,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.rebar = rebar;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -3878,6 +4756,16 @@ mod window_tests {
     }
 }
 
+
+/// Allocates a ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) host copy when opt-in
+/// `VICTORY_REBAR=1|2` permits it and VRAM headroom allows.
+fn rebar_copy(kind: rebar::Kind, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let host = host()?;
+    let res = rebar::reserve(kind, size, false)?;
+    let (buffer, data) = rebar::gpu_upload_buffer(host, size)?;
+    Some((buffer, data, res.commit()))
+}
+
 #[cfg(test)]
 mod card_merge_tests {
     use super::{Card, Shadow};
@@ -4005,4 +4893,161 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod rebar_tests {
+    use super::*;
+
+    /// Live hardware GPU round-trip test for ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`):
+    /// writes via sequential WC stores + `_mm_sfence()`, verifies via
+    /// `slices_equal_wc` and `copy_from_wc` (`VMOVNTDQA` bracketed by `_mm_mfence()`).
+    #[test]
+    fn rebar_wc_write_read_compare_roundtrip() {
+        let Some(h) = host() else {
+            return;
+        };
+        if !rebar::supported() {
+            return;
+        }
+        const LEN: usize = 256 << 10;
+        let Some((buffer, ptr)) = rebar::gpu_upload_buffer(h, LEN as u64) else {
+            return;
+        };
+        let pattern: Vec<u8> = (0..LEN).map(|i| ((i * 29 + (i >> 8) * 7 + 5) & 0xff) as u8).collect();
+        // SAFETY: `ptr` is mapped for `LEN` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), ptr, LEN);
+            wc_sfence();
+            assert!(slices_equal_wc(ptr.cast_const(), pattern.as_ptr(), LEN));
+            let mut out = vec![0u8; LEN];
+            copy_from_wc(ptr.cast_const(), out.as_mut_ptr(), LEN);
+            assert_eq!(out, pattern);
+
+            // Flip a byte at an unaligned offset and verify `slices_equal_wc` catches it.
+            let mut mutated = pattern.clone();
+            mutated[LEN - 13] ^= 0x80;
+            assert!(!slices_equal_wc(ptr.cast_const(), mutated.as_ptr(), LEN));
+        }
+        drop(buffer);
+    }
+
+    /// WC streaming load/compare (`copy_from_wc`, `slices_equal_wc`) and
+    /// `merge_gpu_into_title_runs` match scalar oracles across unaligned prefixes,
+    /// 32/256/4096-byte boundaries, and tails.
+    #[test]
+    fn simd_wc_and_gpu_merge_helpers_match_scalar_oracles() {
+        for &len in &[0usize, 1, 7, 31, 32, 33, 63, 64, 65, 255, 256, 257, 4096, 4129, 8213] {
+            for &align_shift in &[0usize, 1, 15, 31] {
+                let mut src_backing = vec![0u8; len + align_shift + 64];
+                let mut cmp_backing = vec![0u8; len + align_shift + 64];
+                for (i, b) in src_backing.iter_mut().enumerate() {
+                    *b = ((i * 37 + 11) & 0xff) as u8;
+                }
+                cmp_backing.copy_from_slice(&src_backing);
+                let src = &src_backing[align_shift..align_shift + len];
+                let mut dst = vec![0xA5u8; len];
+                // SAFETY: valid non-overlapping slices of length `len`.
+                unsafe { copy_from_wc(src.as_ptr(), dst.as_mut_ptr(), len) };
+                assert_eq!(dst, src, "copy_from_wc len={len} shift={align_shift}");
+
+                // SAFETY: valid slices of length `len`.
+                assert!(unsafe {
+                    slices_equal_wc(src.as_ptr(), cmp_backing[align_shift..].as_ptr(), len)
+                });
+                if len > 0 {
+                    for &pos in &[0, len / 2, len - 1] {
+                        cmp_backing[align_shift + pos] ^= 0x55;
+                        // SAFETY: valid slices of length `len`.
+                        assert!(
+                            !unsafe { slices_equal_wc(src.as_ptr(), cmp_backing[align_shift..].as_ptr(), len) },
+                            "slices_equal_wc missed diff at {pos} len={len}"
+                        );
+                        cmp_backing[align_shift + pos] ^= 0x55;
+                    }
+                }
+            }
+
+            let old: Vec<u8> = (0..len).map(|i| ((i * 13 + 3) & 0xff) as u8).collect();
+            let mut gpu = old.clone();
+            let mut title_a = old.clone();
+            for i in 0..len {
+                match i % 11 {
+                    0 | 1 => gpu[i] ^= 0x3C,
+                    3 => title_a[i] ^= 0xA5,
+                    7 => {
+                        gpu[i] ^= 0x11;
+                        title_a[i] ^= 0x22;
+                    }
+                    _ => {}
+                }
+            }
+
+            let (mut t1, mut r1) = (title_a.clone(), Vec::new());
+            let (mut t2, mut r2) = (title_a.clone(), Vec::new());
+            assert_eq!(
+                merge_gpu_into_title_runs(&mut t1, &gpu, &old, &mut r1),
+                merge_gpu_into_title_runs_scalar(&mut t2, &gpu, &old, &mut r2)
+            );
+            assert_eq!((t1, r1), (t2, r2));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual benchmark: cargo test -p victory-gpu --release bench_rebar -- --ignored --nocapture"]
+    fn bench_rebar() {
+        use std::time::Instant;
+        const MIB: usize = 1 << 20;
+
+        if let Some(h) = host()
+            && rebar::supported()
+        {
+            const LEN: usize = 32 * MIB;
+            let src: Vec<u8> = (0..LEN).map(|i| (i.wrapping_mul(31) & 0xff) as u8).collect();
+            let mut dst = vec![0u8; LEN];
+            if let Some((_sb, sptr)) = h.shared_buffer(LEN as u64) {
+                let t0 = Instant::now();
+                // SAFETY: valid mapping of `LEN` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), sptr, LEN) };
+                let sw_ms = t0.elapsed().as_secs_f64() * 1e3;
+                let t0 = Instant::now();
+                // SAFETY: valid mapping of `LEN` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(sptr, dst.as_mut_ptr(), LEN) };
+                let sr_ms = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "shared_buffer (32 MiB): write {sw_ms:.2} ms ({:.1} GB/s) | read {sr_ms:.2} ms ({:.1} GB/s)",
+                    (LEN as f64 / 1e9) / (sw_ms / 1e3),
+                    (LEN as f64 / 1e9) / (sr_ms / 1e3)
+                );
+            }
+            if let Some((_rb, rptr)) = rebar::gpu_upload_buffer(h, LEN as u64) {
+                let t0 = Instant::now();
+                // SAFETY: valid WC mapping of `LEN` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), rptr, LEN);
+                    wc_sfence();
+                }
+                let rw_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+                let t0 = Instant::now();
+                // SAFETY: valid WC mapping of `LEN` bytes.
+                unsafe { copy_from_wc(rptr.cast_const(), dst.as_mut_ptr(), LEN) };
+                let rr_ms = t0.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(dst, src);
+
+                let t0 = Instant::now();
+                // SAFETY: valid WC mapping of `LEN` bytes.
+                let eq = unsafe { slices_equal_wc(rptr.cast_const(), src.as_ptr(), LEN) };
+                let rc_ms = t0.elapsed().as_secs_f64() * 1e3;
+                assert!(eq);
+
+                eprintln!(
+                    "ReBAR GPU_UPLOAD (32 MiB): write+SFENCE {rw_ms:.2} ms ({:.1} GB/s) | VMOVNTDQA read {rr_ms:.2} ms ({:.1} GB/s) | VMOVNTDQA cmp {rc_ms:.2} ms ({:.1} GB/s)",
+                    (LEN as f64 / 1e9) / (rw_ms / 1e3),
+                    (LEN as f64 / 1e9) / (rr_ms / 1e3),
+                    (LEN as f64 / 1e9) / (rc_ms / 1e3)
+                );
+            }
+        }
+    }
 }
