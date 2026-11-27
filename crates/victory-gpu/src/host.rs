@@ -706,6 +706,24 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// Serializes unit tests that create or use WARP software D3D12 devices so
+/// concurrent `d3d10warp.dll` bring-up/teardown cannot race (`0xc0000005`).
+#[cfg(test)]
+pub(crate) fn warp_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+impl Host {
+    /// Serializes a unit test sweep/eviction call against concurrent
+    /// `Host::execute` submissions, mirroring `Host::submit`'s guarantee
+    /// that `sweep()` runs under `submitted` with no submission in flight.
+    pub(crate) fn test_sweep_lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BUFFER_READ, BUFFER_WRITE, BufferStates};
@@ -791,6 +809,7 @@ mod tests {
 
     #[test]
     fn warp_adapter_accepts_only_software() {
+        let _warp = super::warp_test_lock();
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
         let raw = unsafe {

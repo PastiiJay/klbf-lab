@@ -520,10 +520,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Held last so all WARP D3D12 COM objects drop before releasing the lock.
+        _warp_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let _warp_lock = crate::host::warp_test_lock();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -562,6 +565,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _warp_lock,
                 })
             }
         }

@@ -1214,7 +1214,7 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
         };
         // SAFETY: a pagefile section of two blocks, mapped read-write.
-        let view = unsafe {
+        let (section, view) = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -1224,7 +1224,8 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (section, view)
         };
         assert_ne!(view, 0);
         assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
@@ -1250,15 +1251,18 @@ mod tests {
             guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
-        // SAFETY: our view.
+        // Forget the view before unmapping so another parallel test cannot
+        // reuse this VA range before `title_memory_remapped` runs.
+        title_memory_remapped(view, 2 * BLOCK);
+        // SAFETY: our view and section handle.
         unsafe {
             UnmapViewOfFile(
                 windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: view as *mut _,
                 },
-            )
+            );
+            windows_sys::Win32::Foundation::CloseHandle(section);
         };
-        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -1399,6 +1403,8 @@ mod tests {
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
         assert!(!is_view(at, at + local.len()));
+        // Forget the views before releasing their VA range to parallel tests.
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1408,7 +1414,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
@@ -1483,6 +1488,8 @@ mod tests {
         title_memory_remapped(p + BLOCK, BLOCK);
         assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
         assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        // Forget the views before releasing their VA range to parallel tests.
+        title_memory_remapped(p, 3 * BLOCK);
         // SAFETY: our views and placeholder.
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
@@ -1492,7 +1499,6 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
     }
 
     /// A pagefile section mapped twice: two views of the same physical
