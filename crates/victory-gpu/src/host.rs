@@ -664,7 +664,26 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
-        tracing::info!("host D3D12 device ready");
+        let description = adapter
+            .as_ref()
+            .and_then(|a| a.GetDesc1().ok())
+            .map(|desc| {
+                let name = desc.Description.split(|&c| c == 0).next().unwrap_or_default();
+                String::from_utf16_lossy(name)
+            });
+        // DXGI exposes the user-mode driver version through the IDXGIDevice IID.
+        let driver_version = adapter
+            .as_ref()
+            .and_then(|a| a.CheckInterfaceSupport(&IDXGIDevice::IID).ok())
+            .map(|version| {
+                let v = version as u64;
+                format!("{}.{}.{}.{}", v >> 48, (v >> 32) as u16, (v >> 16) as u16, v as u16)
+            });
+        tracing::info!(
+            adapter = description.as_deref(),
+            driver_version = driver_version.as_deref(),
+            "host D3D12 device ready"
+        );
         Ok(Host {
             device,
             queue,
