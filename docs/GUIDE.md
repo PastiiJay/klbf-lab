@@ -11,13 +11,15 @@ Open **PowerShell** (Start menu → type `PowerShell` → Enter) and paste each 
 ## 1. Check your PC (1 minute)
 
 - A recent graphics card with DirectX 12 (tested on AMD Radeon RX 9070 XT; other AMD and NVIDIA cards are being tested).
-- **More than 8 GB of video memory** recommended: 8 GB cards (RX 6600, RTX 3070…) currently crash at start.
-- **32 GB of RAM**, or 16 GB plus a large page file (step 2). A run uses about 20 GB of memory.
+- **More than 8 GB of video memory is recommended.** Some 8 GB setups have [crashed during startup](https://github.com/PastiiJay/klbf-lab/issues/11). One RTX 2080 8 GB reached the 3D world and ran at about 2–3 FPS in gameplay during a 22-minute diagnostic session. [RTX 2080 report](https://github.com/PastiiJay/klbf-lab/issues/65)
+- **32 GB of RAM** is recommended. On a 16 GB PC, check the page file in step 2.
 - About 15 GB of free disk space for the tools and the shader cache.
 
-## 2. Page file (only if you have 16 GB of RAM)
+## 2. Check the Windows commit limit
 
-Windows needs extra virtual memory. This opens the right settings window:
+If a run reports a memory allocation failure, open **Task Manager → Performance → Memory** and compare the two **Committed** values. On one 32 GB PC running beta-2, the shipped pools reached the roughly 42 GB commit limit. Smaller pools brought the peak down to 36–38 GB, and the Radeon device removal during world load still occurred. Record both the peak and the error when reporting a similar run. [RX 6950 XT report and pool sizes](https://github.com/PastiiJay/klbf-lab/issues/82)
+
+To inspect your page file settings on a 16 GB PC or when committed memory approaches the limit, run
 
 ```powershell
 SystemPropertiesPerformance.exe
@@ -46,7 +48,14 @@ cd klbf-lab
 cargo build --release
 ```
 
-For the latest test build instead, use `git clone -b beta https://github.com/PastiiJay/klbf-lab`.
+The commands above already select the beta branch. If you previously cloned the stable build, run these commands from that checkout to switch and build the latest beta:
+
+```powershell
+git fetch origin
+git switch beta
+git pull --ff-only
+cargo build --release
+```
 
 ## 5. Get AMD's FidelityFX SDK (for the faster Series S mode)
 
@@ -84,7 +93,7 @@ target\release\victory.exe run --console series-s C:\Games\Title\game_scarlett_m
 ```
 
 - **Plug in the controller before starting.**
-- On the stable build the start screen and menus can stay **black**: press **A** (or Enter) to get past them.
+- On the stable build the start screen and menus can stay **black**. Press **A** on the controller to advance. Enter also works on the start screen. The [account picker only responds to the controller](https://github.com/PastiiJay/klbf-lab/issues/69).
 - The first minutes in a new area are slow while shaders finish loading.
 - Saves work (autosave and manual).
 
@@ -103,13 +112,22 @@ Then step 6, step 7 again, and step 8.
 | What you see | What to do |
 |---|---|
 | `amd_fidelityfx_loader_dx12.dll not found`, then a crash | Step 5, and check the path in `VICTORY_FFX_DIR` |
-| Crash about 3 seconds after start, black window | Not enough memory: step 2 (page file), close other programs |
+| Crash about 3 seconds after start, black window | Check step 2 on a 16 GB system. This symptom has several possible causes. If it persists on beta, include the build and driver details below |
 | `X3506` or `vs_5_1` in the log, black window | Old Windows shader compiler: copy the x64 `d3dcompiler_47.dll` from a recent Windows SDK (`Redist\D3D\x64`) next to `victory.exe` |
 | `error: unexpected argument '--cache'` | You built an old copy: redo step 4 |
 | Graphics card stops responding after ~1 min | `$env:VICTORY_LATE_WAIT = '0'` |
 | Crash while loading: the log shows `dstorage: request failed: zlib … hr=0x8007000d`, then `0x80000003` at `victory-image…+0x19b5024` | Some game files are incomplete or damaged: copy the game folder again from your source (thanks @Emaxoso) |
 
-Still stuck? Open an [issue](https://github.com/PastiiJay/klbf-lab/issues) with your graphics card, driver version, Windows version and the last lines PowerShell printed.
+Still stuck? From the same checkout where you built the executable, run:
+
+```powershell
+git branch --show-current
+git rev-parse --short HEAD
+Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
+Get-CimInstance Win32_OperatingSystem | Select-Object Caption, BuildNumber
+```
+
+Include the output in your [issue](https://github.com/PastiiJay/klbf-lab/issues), along with the last lines PowerShell printed. If you downloaded a binary, give its release or build label instead of the Git details. For a black window at startup, mention whether any logo or menu appeared and whether the result changed after trying beta.
 
 ---
 
