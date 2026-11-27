@@ -157,8 +157,9 @@ impl CopiedPages {
 
     /// Plans the coalesced byte ranges `[run_from, run_to)` inside `[from, to)`
     /// that must be copied from title memory, updating whole-page copied
-    /// timestamps to `now`. Runs purely on metadata so callers can release the
-    /// `copied` mutex before invoking memory copies.
+    /// timestamps to `now`. Callers keep `self.copied` held until the planned
+    /// copies complete so concurrent refreshes cannot observe stamped pages before
+    /// their bytes land.
     #[allow(clippy::too_many_arguments)]
     fn plan_stale(
         &mut self,
@@ -1067,12 +1068,10 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(c) = shadow.card.as_ref() else {
             return true;
         };
-        let has_dirty = c.has_dirty.load(Ordering::Acquire);
-        let has_sent = relay_on && c.has_sent.load(Ordering::Acquire);
-        if !has_dirty && !has_sent {
+        if !c.has_dirty.load(Ordering::Acquire) {
             return true;
         }
-        let ranges = if has_dirty {
+        let ranges = {
             let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let ranges = std::mem::take(&mut *dirty);
             if relay_on {
@@ -1086,12 +1085,6 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             }
             c.has_dirty.store(false, Ordering::Release);
             ranges
-        } else {
-            // Only pruning stale `sent` entries (respects `dirty` -> `sent` lock order).
-            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-            sent.retain(|s| s.2 > fetched);
-            c.has_sent.store(!sent.is_empty(), Ordering::Release);
-            Vec::new()
         };
         if !ranges.is_empty() {
             out.push((shadow, joined(ranges)));
@@ -4771,26 +4764,25 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer. Plans coalesced runs under
-    /// `self.copied`, then releases the mutex before executing the copies.
+    /// asking), whole pages within the buffer. Keeps `self.copied` locked
+    /// until the planned copies finish.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
-        let runs = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if has_deferred {
-                copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
-                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
-                })
-            } else {
-                copied.plan_stale(base, start, end, from, to, now, written)
-            }
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = if has_deferred {
+            copied.plan_stale_filtered(base, start, end, from, to, now, written, |idx| {
+                is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+            })
+        } else {
+            copied.plan_stale(base, start, end, from, to, now, written)
         };
         let mut bytes = 0;
         for (run_from, run_to) in runs.iter() {
             bytes += self.copy(run_from, run_to);
         }
+        drop(copied);
         bytes
     }
 
