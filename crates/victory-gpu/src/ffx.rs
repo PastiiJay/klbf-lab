@@ -18,6 +18,7 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::time::Instant;
 
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::core::{Interface, PCSTR, PCWSTR};
@@ -1028,23 +1029,32 @@ pub(crate) fn framegen_before_present(
 /// swap chain's count of presents (real and generated): once a second, the
 /// real frame rate and the presented one.
 pub(crate) fn framegen_after_present(presented: Option<u32>) {
-    let real = FRAME.fetch_add(1, Ordering::AcqRel) + 1;
-    static SINCE: std::sync::Mutex<Option<(std::time::Instant, u64, u32)>> = std::sync::Mutex::new(None);
+    static SINCE: std::sync::Mutex<Option<(Instant, u64, u32)>> = std::sync::Mutex::new(None);
     let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
-    let presented = presented.unwrap_or(0);
-    let Some((at, real_then, presented_then)) = *since else {
-        *since = Some((std::time::Instant::now(), real, presented));
-        return;
-    };
-    let seconds = at.elapsed().as_secs_f64();
-    if seconds < 1.0 {
-        return;
+    let real = FRAME.fetch_add(1, Ordering::AcqRel) + 1;
+    if let Some((real_fps, presented_fps)) = present_rates(&mut since, Instant::now(), real, presented) {
+        let on = !CONTEXT.load(Ordering::Acquire).is_null() && !FAILED.load(Ordering::Relaxed);
+        tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {presented_fps:.1} fps presented");
     }
+}
+
+fn present_rates(
+    since: &mut Option<(Instant, u64, u32)>,
+    now: Instant,
+    real: u64,
+    presented: Option<u32>,
+) -> Option<(f64, f64)> {
+    // DXGI counts are cumulative. Keep the last valid baseline if the query fails.
+    let presented = presented?;
+    let (at, real_then, presented_then) = *since.get_or_insert((now, real, presented));
+    let seconds = now.duration_since(at).as_secs_f64();
+    if seconds < 1.0 {
+        return None;
+    }
+    *since = Some((now, real, presented));
     let real_fps = (real - real_then) as f64 / seconds;
     let presented_fps = f64::from(presented.wrapping_sub(presented_then)) / seconds;
-    let on = !CONTEXT.load(Ordering::Acquire).is_null() && !FAILED.load(Ordering::Relaxed);
-    tracing::info!(on, "ffx: frame generation: {real_fps:.1} real fps, {presented_fps:.1} fps presented");
-    *since = Some((std::time::Instant::now(), real, presented));
+    Some((real_fps, presented_fps))
 }
 
 fn missing_texture(slot: usize, title: This) {
@@ -1061,6 +1071,22 @@ fn missing_texture(slot: usize, title: This) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_rates_span_failed_queries_and_preserve_a_real_counter_wrap() {
+        use std::time::Duration;
+        let start = Instant::now();
+        let mut since = None;
+        let mut sample = |ms, real, count| {
+            present_rates(&mut since, start + Duration::from_millis(ms), real, count)
+        };
+        assert_eq!(sample(0, 1, None), None);
+        assert_eq!(sample(1000, 2, Some(u32::MAX - 3)), None);
+        assert_eq!(sample(1500, 3, Some(u32::MAX - 2)), None);
+        assert_eq!(sample(2000, 4, None), None);
+        assert_eq!(sample(3000, 5, Some(0)), Some((1.5, 2.0)));
+        assert_eq!(sample(4000, 6, Some(0)), Some((1.0, 0.0)));
+    }
 
     #[test]
     fn create_takes_the_upscale_description_only_beside_the_console_backend() {
