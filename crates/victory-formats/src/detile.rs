@@ -2434,7 +2434,7 @@ mod pool_tests {
             swizzle: Swizzle::SW_4KB_D,
         };
 
-        // 1. Mutated `m.pitch = 0` on a >= 512 KiB layout must be rejected by
+        // 1. Mutated `m.pitch = 0` on a multi-block-row layout must be rejected by
         //    `prepare_thin_geometry` so `copy_thin_tile` never races across `by`.
         let mut pitch_zero = Layout::new(&base_desc).unwrap();
         pitch_zero.mips[0].pitch = 0;

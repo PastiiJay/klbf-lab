@@ -2184,14 +2184,16 @@ mod tests {
         }
     }
 
-    /// Exercises the parallel worker pool (`>= 512 KiB`) on both power-of-two
-    /// and NPOT textures across non-XOR and XOR swizzle modes (BC7, BC1, RGBA8,
-    /// R8, Z_X, R_X), plus concurrent multi-caller `try_lock` fallback,
+    /// Exercises sub-threshold inline (`1 MiB`), exact-boundary (`2 MiB`), and
+    /// strictly above-threshold parallel worker pool (`> 2 MiB`, e.g. 3 MiB
+    /// NPOT and 4 MiB POT) execution across non-XOR and XOR swizzle modes (BC7,
+    /// RGBA8, R8, `SW_64KB_D`, `SW_64KB_S`, `SW_64KB_R_X`, `SW_64KB_Z_X`,
+    /// `SW_4KB_D_X`), plus concurrent multi-caller `try_lock` fallback,
     /// verifying bit-exact parity for both `detile` and `tile`.
     #[test]
     fn parallel_threshold_and_concurrent_callers_match_scalar_reference() {
         let cases = [
-            // 1024x1024 BC7 -> 256x256x16 = 1 MiB (SW_64KB_D)
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB inline (SW_64KB_D)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
@@ -2207,7 +2209,7 @@ mod tests {
                 Pipes::SERIES_X,
                 0u32,
             ),
-            // 1024x1024 BC7 -> 256x256x16 = 1 MiB (SW_64KB_S)
+            // 1024x1024 BC7 -> 256x256x16 = 1 MiB inline (SW_64KB_S)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
@@ -2223,7 +2225,7 @@ mod tests {
                 Pipes::SERIES_X,
                 0,
             ),
-            // NPOT 1027x515 RGBA8 -> ~2.1 MiB with right & bottom remainders (SW_64KB_D)
+            // NPOT 1027x515 RGBA8 -> exact 2 MiB full micro-tile body + remainders (SW_64KB_D)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
@@ -2239,7 +2241,7 @@ mod tests {
                 Pipes::SERIES_X,
                 0,
             ),
-            // NPOT 1027x515 RGBA8 -> ~2.1 MiB with XOR (SW_64KB_R_X, Series X + pbx)
+            // NPOT 1027x515 RGBA8 -> exact 2 MiB full micro-tile body + remainders (SW_64KB_R_X)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
@@ -2255,7 +2257,7 @@ mod tests {
                 Pipes::SERIES_X,
                 0x1b,
             ),
-            // 1024x512 RGBA8 -> 2 MiB (SW_64KB_Z_X, Series S + pbx)
+            // 1024x512 RGBA8 -> exact 2 MiB full body (SW_64KB_Z_X, Series S + pbx)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
@@ -2271,7 +2273,55 @@ mod tests {
                 Pipes::SERIES_S,
                 0x0d,
             ),
-            // 1024x1024 R8 -> 1 MiB (SW_4KB_D_X)
+            // 2048x2048 BC7 -> 512x512x16 = 4 MiB (> PARALLEL_MIN_BYTES, non-XOR SW_64KB_D)
+            (
+                Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 2048,
+                    height: 2048,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_D,
+                },
+                Pipes::SERIES_X,
+                0,
+            ),
+            // NPOT 2056x1544 BC7 -> 514x386 blocks (3 MiB full body > PARALLEL_MIN_BYTES + remainders, XOR SW_64KB_R_X)
+            (
+                Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 2056,
+                    height: 1544,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_R_X,
+                },
+                Pipes::SERIES_X,
+                0x1b,
+            ),
+            // 2048x2048 BC7 -> 512x512x16 = 4 MiB (> PARALLEL_MIN_BYTES, XOR SW_64KB_Z_X, Series S + pbx)
+            (
+                Desc {
+                    dimension: Dimension::Tex2d,
+                    width: 2048,
+                    height: 2048,
+                    depth: 1,
+                    mips: 1,
+                    element_bytes: 16,
+                    block: 4,
+                    samples: 1,
+                    swizzle: Swizzle::SW_64KB_Z_X,
+                },
+                Pipes::SERIES_S,
+                0x0d,
+            ),
+            // 1024x1024 R8 -> 1 MiB inline (SW_4KB_D_X)
             (
                 Desc {
                     dimension: Dimension::Tex2d,
