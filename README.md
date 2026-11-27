@@ -30,7 +30,9 @@ No game files are included. You need your own legally obtained copy.
 
 > **Stability policy:** we never publish a build that crashed in our tests. Every session length shown here is when **we** stopped, to get back to work on the project or because a test run reached its planned end, not a crash.
 
-Speed in Lab 39 runs: median 6.6–8.4 fps in the world (720p upscaled to 1080p with AMD FSR). Stability record: 77 min of play without a crash on Lab 39 (stopped by choice); it has never crashed in our test runs. If the device is lost about a minute after the world starts loading, try `VICTORY_LATE_WAIT=0`.
+Speed in Lab 39 runs: median 6.6–8.4 fps in the world (720p upscaled to 1080p with AMD FSR). Stability record: 77 min of play without a crash on Lab 39 (stopped by choice); it has never crashed in our test runs.
+
+If the GPU is lost during play, repeat the same scene with `VICTORY_LATE_WAIT=0` and keep the other settings fixed. On one RX 9070 XT, `1` lost the device after about 10 minutes. With `0`, the same tester ran for 32 minutes before a separate title-side crash. An RX 9070 also reported device loss with the example settings. [RX 9070 XT comparison](https://github.com/PastiiJay/klbf-lab/issues/31#issuecomment-7176192100) · [RX 9070 report](https://github.com/PastiiJay/klbf-lab-beta/issues/6)
 
 ## Built by KLBF Lab
 
@@ -87,7 +89,7 @@ Then play with:
 ```powershell
 $env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\klbf\skip-amd.txt -Raw).Trim()
-$env:VICTORY_LATE_WAIT = '1'
+$env:VICTORY_LATE_WAIT = '1'   # If the GPU is lost during play, retry this line with '0'.
 $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '24'
 $env:VICTORY_RELAY_COPY_QUEUE = '0'
