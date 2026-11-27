@@ -485,6 +485,11 @@ pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync:
 /// The process's private bytes (diagnostics: around the making of lists).
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
+    bench_process_memory().0
+}
+
+/// Process private commit and working set in bytes, for benchmark telemetry.
+pub(crate) fn bench_process_memory() -> (u64, u64) {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -493,7 +498,13 @@ fn private_bytes() -> u64 {
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    c.PagefileUsage as u64
+    (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+/// Local adapter VRAM usage and budget in bytes, for benchmark telemetry.
+pub(crate) fn bench_video_memory() -> Option<(u64, u64)> {
+    let [budget, used, _, _] = host()?.video_memory()?;
+    Some((used, budget))
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a

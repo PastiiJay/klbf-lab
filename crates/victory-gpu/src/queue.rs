@@ -938,6 +938,10 @@ extern "system" fn present(
     #[cfg(windows)]
     log_first_presents(frame, all);
     #[cfg(windows)]
+    let mut black_frame = false;
+    #[cfg(not(windows))]
+    let black_frame = false;
+    #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // The one resource asked for (the first plane's if there is no such
         // plane, its last if no such resource), or all of them.
@@ -984,6 +988,7 @@ extern "system" fn present(
         }
         if !layers.is_empty() {
             let shown = host.present(&layers, frame);
+            black_frame = shown.unwrap_or(false);
             for &(resource, state) in shown_resources.iter().rev() {
                 crate::resource::host_transition(resource, state);
             }
@@ -995,6 +1000,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
+    crate::bench::on_present(drawn, black_frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

@@ -32,6 +32,8 @@ const ALLOWED_PATHS: &[&str] = &[
     "docs/klbf/logo.svg",
     "docs/klbf/summarize_log.py",
     "tests/check_cold_cache.py",
+    "tools/bench_loop.py",
+    "tools/test_bench_loop.py",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.

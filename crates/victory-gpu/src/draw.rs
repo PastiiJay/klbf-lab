@@ -1459,6 +1459,7 @@ impl State {
             {
                 alive = false;
                 GONE.store(true, Ordering::Relaxed);
+                crate::bench::mark_device_removed();
                 let last: Vec<String> = slots[n - 63..=n]
                     .iter()
                     .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
@@ -1966,6 +1967,7 @@ impl State {
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
                 GONE.store(true, Ordering::Relaxed);
+                crate::bench::mark_device_removed();
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
