@@ -2858,6 +2858,131 @@ impl<'a> Lower<'a> {
         self.s.m.extract(entry, r, index % 4)
     }
 
+    /// Whether `to` is computed from `from` by scalar or vector arithmetic
+    /// (moves included), within `depth` instructions.
+    fn reaches(&self, from: Value, to: Value, depth: u32) -> bool {
+        if from == to {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            i.reads.iter().any(|r| r.1 == from)
+                && matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+                && i.writes.iter().any(|w| self.reaches(w.1, to, depth - 1))
+        })
+    }
+
+    /// Whether the scalar buffer load `inst` reads its view `src` at an
+    /// offset computed from that view's own record count (dword 2 of the
+    /// descriptor its scalar load read): the console's "last record"
+    /// idiom (see [`super::Options::self_sized_loads_via_memory`]).
+    fn self_sized(&self, inst: &Inst, src: &Source, soffset: &Operand) -> bool {
+        let Source::Loaded { load, first: 0 } = src else {
+            return false;
+        };
+        let Operand::Scalar { code: so, .. } = *soffset else {
+            return false;
+        };
+        if so == NULL {
+            return false;
+        }
+        let Some(off) = inst.read(Reg::S(so)) else {
+            return false;
+        };
+        let load = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = load.fields
+        else {
+            return false;
+        };
+        load.write(Reg::S(code + 2))
+            .is_some_and(|size| self.reaches(size, off, 6))
+    }
+
+    /// A self-sized scalar buffer load ([`Self::self_sized`]) through title
+    /// memory: the `count` dwords at the view's address plus `addr`, each
+    /// 0 past the view's end (as the console's load reads), into the SGPRs
+    /// from `code`. Falls back to the view where its address is not known.
+    fn self_sized_load(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        addr: V,
+        code: u8,
+        count: u32,
+    ) -> Result<(), Why> {
+        let Source::Loaded { load, .. } = src else {
+            unreachable!("self_sized checked it")
+        };
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let h = self.handle(site, src, false, (11, 0))?;
+        let Some((lo, hi)) = self.view_address(*load) else {
+            // No address to read at: through the view, as before.
+            for k in 0..count {
+                let off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (mask, u, al) = (self.s.m.i8(1), self.s.m.undef(i32t), self.s.m.i32(4));
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, a, u, mask, al],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                let x = self.as_int(x);
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        };
+        // The view's size in bytes, for the end (asked of the view; only
+        // the load moves to title memory).
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let u = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, u]);
+        let size = self.s.m.extract(c, d, 0);
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            // The whole dword inside the view: `a < size` and `size - a >= 4`
+            // (not `a + 4 <= size`, which wraps for an offset just under
+            // 4 GiB: the last record of an empty buffer). Only a dword
+            // inside notes a missing page for the host.
+            let before_end = self.s.m.cmp(c, pred::IULT, a, size);
+            let left = self.s.m.bin(c, Bin::Sub, size, a);
+            let four = self.s.m.i32(4);
+            let fits = self.s.m.cmp(c, pred::IUGE, left, four);
+            let inside = self.s.m.bin(c, Bin::And, before_end, fits);
+            let lo_k = self.s.m.bin(c, Bin::Add, lo, a);
+            let carry = self.s.m.cmp(c, pred::IULT, lo_k, lo);
+            let carry = self.s.m.cast(c, Cast::ZExt, carry, i32t);
+            let hi_k = self.s.m.bin(c, Bin::Add, hi, carry);
+            let (mh, byte) = self.memory(lo_k, hi_k, Some(inside));
+            let (mask, u, al) = (self.s.m.i8(1), self.s.m.undef(i32t), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[mh, byte, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            let zero = self.s.m.i32(0);
+            let x = self.s.m.select(c, inside, x, zero);
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
     /// Whether some instruction computes with `v` (scalar or vector
     /// arithmetic), rather than only naming it in a descriptor operand,
     /// moving it (at most `depth` moves are followed) or comparing it: a
@@ -5819,6 +5944,12 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if uav || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            if !uav
+                && super::options().self_sized_loads_via_memory
+                && self.self_sized(inst, src, soffset)
+            {
+                return self.self_sized_load(inst, site, src, addr, code, count);
+            }
             let h = self.handle(site, src, false, (11 | uav_bits(uav, cache.glc), 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
