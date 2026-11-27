@@ -7059,6 +7059,7 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
+        let lazy = crate::shadow::lazy_copyback().then(crate::shadow::lazy_stats);
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         // Over the same frames as the counts above.
@@ -7130,6 +7131,21 @@ impl Meter {
                     per_frame(4) / 1e6,
                     per_frame(5),
                     per_frame(6) / 1e3
+                );
+            }
+            if let Some(lazy) = lazy {
+                tracing::info!(
+                    "lazy copy-back per frame: {:.1} newly armed, {:.1} steady hits, {:.1} VEH read faults, \
+                     {:.1} VEH write faults, {:.1} explicit flushes, {:.2} MB read back, {:.1} self-bypassed; \
+                     {} pages armed now",
+                    lazy[0] as f64 / frames,
+                    lazy[1] as f64 / frames,
+                    lazy[2] as f64 / frames,
+                    lazy[3] as f64 / frames,
+                    lazy[4] as f64 / frames,
+                    lazy[5] as f64 / (1 << 20) as f64 / frames,
+                    lazy[6] as f64 / frames,
+                    lazy[7],
                 );
             }
             tracing::info!(

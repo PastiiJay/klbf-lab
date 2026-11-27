@@ -4565,8 +4565,24 @@ fn lazy_table_remove_page(table: &mut LazyTable, page: usize) -> Option<LazyEntr
 static LAZY_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Counters: `[0]=newly_armed, [1]=steady_state_hits, [2]=veh_read_faults,
-/// [3]=veh_write_faults, [4]=explicit_flushes, [5]=bytes_flushed`.
-static LAZY_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// [3]=veh_write_faults, [4]=explicit_flushes, [5]=bytes_flushed,
+/// [6]=self_bypassed` (hot-cooled or permanently ineligible fast-rejects).
+static LAZY_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Per-interval deltas of `LAZY_STATS[0..7]` plus live `LAZY_ARMED_COUNT`
+/// (`[0]=newly_armed, [1]=steady_hits, [2]=veh_read_faults, [3]=veh_write_faults,
+/// [4]=explicit_flushes, [5]=bytes_flushed, [6]=self_bypassed, [7]=armed_now`).
+/// Keeps `LAZY_STATS` monotonic so tests and external readers never lose counts.
+pub(crate) fn lazy_stats() -> [u64; 8] {
+    static PREV: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    let mut out = [0u64; 8];
+    for (dst, (stat, prev)) in out.iter_mut().zip(LAZY_STATS.iter().zip(&PREV)) {
+        let cur = stat.load(Ordering::Relaxed);
+        *dst = cur.saturating_sub(prev.fetch_max(cur, Ordering::Relaxed));
+    }
+    out[7] = LAZY_ARMED_COUNT.load(Ordering::Relaxed) as u64;
+    out
+}
 
 /// Dedicated single-piece GPU readback context (Level 2), pre-allocated before
 /// any `PAGE_NOACCESS` page is ever armed so VEH never allocates D3D12 objects.
@@ -5714,11 +5730,13 @@ impl Shadow {
             return true;
         }
         if state == LAZY_INELIGIBLE {
+            LAZY_STATS[6].fetch_add(1, Ordering::Relaxed);
             return false;
         }
         if state == LAZY_HOT {
             let cool = self.lazy_cool_until[idx].load(Ordering::Acquire);
             if cool == u32::MAX || cur_frame < cool {
+                LAZY_STATS[6].fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             if self.lazy_state[idx]
@@ -8197,6 +8215,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
         let list = h.new_list().expect("new_list");
 
         // Part A: Hot-page strike escalation (frame 100 -> 110 -> 415 -> 2220).
+        let _ = lazy_stats();
+        let bypass_before = LAZY_STATS[6].load(Ordering::Relaxed);
         let _frame_guard = LazyFrameGuard::set(100);
         let block = VirtualBlock::new(PAGE, true);
         // SAFETY: seed physical page.
@@ -8287,8 +8307,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
         let _ = virgin_shadow.update(virgin_block.addr(), PAGE);
         assert!(virgin_shadow.try_defer_piece(0, PAGE));
         assert_eq!(virgin_shadow.lazy_state[0].load(Ordering::Acquire), LAZY_DEFERRED);
+        let snap = lazy_stats();
+        assert_eq!(snap[7], 1, "live armed_now must reflect the currently armed page");
+        assert!(snap[0] >= 5, "expected newly_armed delta >= 5, got {}", snap[0]);
+        assert!(snap[2] >= 4, "expected VEH read fault delta >= 4, got {}", snap[2]);
+        assert!(snap[5] >= 4 * PAGE as u64, "expected bytes_flushed delta >= 4 pages");
+        assert_eq!(snap[6], 5, "expected 5 self-bypass fast-rejects (3 hot + 2 ineligible)");
+        assert_eq!(
+            LAZY_STATS[6].load(Ordering::Relaxed) - bypass_before,
+            5,
+            "lazy_stats() must preserve monotonic LAZY_STATS counters"
+        );
         drop(virgin_shadow);
 
         assert_eq!(LAZY_ARMED_COUNT.load(Ordering::Acquire), 0);
+        assert_eq!(lazy_stats()[7], 0);
     }
 }
