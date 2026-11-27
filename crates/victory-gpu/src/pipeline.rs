@@ -826,7 +826,7 @@ impl Prebuild {
         // Without the run's log lines per shader and pipeline.
         let quiet = tracing::Dispatch::none();
         let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            host::HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_, _| {})
         });
         match made {
             Some(_) => Ok(()),
