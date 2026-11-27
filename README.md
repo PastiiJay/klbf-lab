@@ -109,6 +109,18 @@ If the world takes seconds a frame under Wine/Proton while the GPU is mostly idl
 
 A `wineserver` that keeps the views in a tree fixes it: [CachyOS/wine-cachyos#50](https://github.com/CachyOS/wine-cachyos/pull/50) (by ajsem1337, based on neonbyte1's version; also measured in [fxceless/victory-fork#184](https://github.com/fxceless/victory-fork/issues/184)). It changes only `server/`, so it can be built for the Wine of your Proton and dropped into a copy of that Proton as `files/bin/wineserver`; the server protocol version must match the Proton build (regenerate `server_protocol.h` with `tools/make_requests` before building). On an RX 6900 XT with Proton Experimental 11.0-20261112, same build and settings, the first minutes in the world went from 2,068 to 509 ms a frame (textures 482 → 73 ms, copies 417 → 99 ms) and `wineserver` from ~70 % to ~6 % of a core.
 
+### Switches measured under Proton (win10-test builds)
+
+With the view-tree `wineserver` in place, three switches of the `win10-test` line (fxceless/victory-fork's newer copy and relay code; `beta` does not read the last two) changed the world frame most on Linux. Measured on an RX 6900 XT (RADV, Mesa 26.3.1), Proton Experimental 11.0-20261112, Series X, the same opening scene, the median of the first 150 seconds in the world, one variable changed per run:
+
+| Change | ms a frame | What moved |
+|---|---|---|
+| `VICTORY_LATE_WAIT` unset (the relay and stage 3, the code's default) instead of `0` | 289 → 239 | GPU wait 78 → 28 ms; copy-back moves to its own thread |
+| `VICTORY_RELAY_COPY_QUEUE=1` (fetches on a queue of their own) instead of `0` | 257 → 206 | the copy-back thread's wait for fetches 29 → 1 ms |
+| `VICTORY_COPY_COMPARE=1` | 206 → 207 | bytes put into card copies 170 → 32 MB a frame; the CPU now compares instead, so the frame did not move on this processor |
+
+The guide's `VICTORY_LATE_WAIT=0` for cards that stop responding still applies there; on this rig the relay ran without a device loss. Frame captures (`VICTORY_CAPTURE_WORLD`) cost about 235 ms each on the submitting thread. For a speed run, `unset VICTORY_CAPTURE_WORLD` before launch: the switch checks only whether the variable is set, so `0` still captures. If you need pictures while measuring, `VICTORY_CAPTURE_WORLD_EVERY=64` spaces them out.
+
 Please report results in an [issue](https://github.com/PastiiJay/klbf-lab/issues): GPU, driver, how long it ran, fps in the window title, and what looks wrong. For a scene-by-scene report, run `py -3 docs/klbf/summarize_log.py run.log --lines FIRST LAST` with the first and last line numbers for one scene. The [log summary tool](docs/klbf/summarize_log.py) reports median timing samples and separates real and presented FPS when frame generation is logged. Patch notes: [CHANGELOG.md](CHANGELOG.md). Full run log: [docs/klbf/results.md](docs/klbf/results.md).
 
 Product names are only used to say what this works with; they belong to their owners. KLBF Lab is not affiliated with them. License: GPL-3.0.
