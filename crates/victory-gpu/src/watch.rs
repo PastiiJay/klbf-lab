@@ -1182,16 +1182,24 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
-        // SAFETY: committed pages of ours.
-        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
-        // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
-        assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        // A reused virtual address can already have entries in the process-wide
+        // journal. The second round exercises that history on every run.
+        for offset in [PAGE, 2 * PAGE] {
+            let (baseline, before) = writes(start, end, false).expect("watched");
+            assert!(before.iter().all(|&(_, stamp)| stamp < baseline));
+
+            let addr = p + offset;
+            // SAFETY: a committed page of our allocation.
+            unsafe { ((addr + 8) as *mut u8).write(1) };
+            let (now, mut after) = writes(start, end, false).expect("watched");
+            after.retain(|&(_, stamp)| stamp > baseline);
+            assert_eq!(after, [(addr / PAGE, now)]);
+
+            // Another asker after the kernel's bit was cleared still sees it.
+            let (later, again) = writes(addr, addr + PAGE, false).expect("watched");
+            assert!(later > now);
+            assert_eq!(again, [(addr / PAGE, now)]);
+        }
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
