@@ -60,6 +60,23 @@ class SessionReportTests(unittest.TestCase):
                 self.assertEqual((data["samples"], data["median"], data["minutes"]), (2, 13.5, 1.0))
                 self.assertEqual(data["log_sha256_16"], hashlib.sha256(raw).hexdigest()[:16])
 
+    def test_bench_window_uses_fractional_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "session.log"
+            report = Path(directory) / "report.json"
+            # The second sample is 299.2 seconds after the first. The third
+            # falls exactly on the exclusive 300-second boundary.
+            stamps = ["10:00:00.900000", "10:05:00.100000", "10:05:00.900000"]
+            log.write_text("".join(
+                f"2026-11-26T{stamp}Z INFO 12 fps, 83.333 ms/frame, 1000 draws/frame\n"
+                for stamp in stamps
+            ), encoding="utf8")
+            subprocess.run([sys.executable, str(Path(__file__).with_name("fps-session.py")),
+                            str(log), "--bench", "bm-v1", "--out", str(report)],
+                           check=True, capture_output=True)
+            data = json.loads(report.read_text(encoding="utf8"))
+            self.assertEqual(data["samples"], 2)
+
     def test_bench_fallback_cuts_300_seconds_and_is_not_certified(self):
         start = datetime(2026, 11, 26, tzinfo=timezone.utc)
         for seconds, samples, complete in [(400, 300, True), (100, 100, False)]:

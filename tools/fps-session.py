@@ -55,21 +55,21 @@ bad = 0
 for line in read_session(a.log):
     m = sample.search(line)
     if m and int(m.group(3)) >= 1000:
-        ts = re.match(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)', line)
-        if a.bench and not ts:
+        ts = re.match(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)', line)
+        stamp = datetime.fromisoformat(ts.group(1)) if ts else None
+        if a.bench and stamp is None:
             continue  # the cut is by the log's clock: an untimed sample cannot be placed
-        if a.bench and t and (datetime.fromisoformat(ts.group(1)) - t[0]).total_seconds() >= BENCH_S:
+        if a.bench and t and (stamp - t[0]).total_seconds() >= BENCH_S:
             break
         fps, ms = float(m.group(1)), float(m.group(2))
         # Each line carries both the rate and the frame time: an edited rate no longer matches its frame time.
         if ms > 0 and abs(fps - 1000 / ms) > max(0.6, 0.08 * fps):
             bad += 1
         v.append(fps)
-        if ts:
-            d = datetime.fromisoformat(ts.group(1))
-            if t and d < t[-1]:
+        if stamp is not None:
+            if t and stamp < t[-1]:
                 bad += 1  # time going backwards: lines moved or pasted
-            t.append(d)
+            t.append(stamp)
 if not v:
     raise SystemExit('no world samples found')
 s = sorted(v); n = len(s)
