@@ -23,7 +23,7 @@ clap.workspace = true
 walkdir.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
+windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
